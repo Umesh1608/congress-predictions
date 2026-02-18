@@ -48,7 +48,7 @@ class TwitterCollector(BaseCollector):
         max_tweets_per_user: int = 20,
     ) -> None:
         super().__init__()
-        self.bearer_token = bearer_token or settings.twitter_bearer_token
+        self.bearer_token = bearer_token if bearer_token is not None else settings.twitter_bearer_token
         self.accounts = accounts or CONGRESS_TWITTER_ACCOUNTS
         self.max_tweets_per_user = max_tweets_per_user
 

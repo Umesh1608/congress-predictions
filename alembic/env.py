@@ -9,7 +9,10 @@ from src.config import settings
 from src.db.postgres import Base
 
 # Import all models so they register with Base.metadata
-from src.models import member, trade, financial, legislation  # noqa: F401
+from src.models import (  # noqa: F401
+    member, trade, financial, legislation,
+    lobbying, campaign_finance, media, ml, signal,
+)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)

@@ -53,6 +53,9 @@ async def collect_and_load(factory, collector_cls):
                 count = await upsert_trades(session, records)
                 logger.info("[%s] Loaded %d new trades", collector.source_name, count)
         return len(records)
+    except Exception as e:
+        logger.warning("[%s] Collection failed (skipping): %s", collector.source_name, e)
+        return 0
     finally:
         await collector.close()
 
