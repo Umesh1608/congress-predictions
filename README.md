@@ -137,6 +137,10 @@ streamlit run dashboard/app.py
 
 All collectors use a skip-if-no-key pattern — missing API keys are silently skipped, not errors.
 
+> **Optional paid upgrades:** The system is pre-built to support two paid data sources that can be activated at any time by adding their API keys to `.env`:
+> - **X/Twitter API (~$200/mo)** — Real-time social media sentiment from congressional accounts. The collector, transform logic, and Celery task are fully implemented; just set `TWITTER_BEARER_TOKEN` and add the task to the beat schedule.
+> - **Financial Modeling Prep (~$15-30/mo)** — Structured, cleaned trade disclosure data as a complement to the free House/Senate Stock Watcher sources. Set `FMP_API_KEY` to activate. Already included in the default beat schedule.
+
 ---
 
 ## ML Pipeline
