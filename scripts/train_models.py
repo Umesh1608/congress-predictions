@@ -38,11 +38,22 @@ CHAMBER_MAP = {"house": 0, "senate": 1}
 TX_DIR_MAP = {"purchase": 1, "sale": -1, "sale_full": -1, "sale_partial": -1, "exchange": 0}
 
 
-async def build_dataset_fast(session: AsyncSession, limit: int = 20000) -> pd.DataFrame:
-    """Build training dataset using bulk SQL — 100x faster than per-trade queries."""
+async def build_dataset_fast(session: AsyncSession, limit: int = 20000, horizon: str = "21d") -> pd.DataFrame:
+    """Build training dataset using bulk SQL — 100x faster than per-trade queries.
 
-    logger.info("Loading trades with member and stock data...")
+    horizon: "5d", "21d", "63d", or "90d"
+    """
+    # Map horizon to trading-day offset
+    HORIZON_OFFSETS = {"5d": 4, "21d": 20, "63d": 62, "90d": 89}
+    # Days of calendar buffer needed for the horizon + some safety margin
+    HORIZON_BUFFER = {"5d": 10, "21d": 35, "63d": 100, "90d": 140}
 
+    offset = HORIZON_OFFSETS.get(horizon, 20)
+    buffer_days = HORIZON_BUFFER.get(horizon, 35)
+
+    logger.info("Loading trades (horizon=%s, offset=%d trading days)...", horizon, offset)
+
+    cutoff_date = date.today() - timedelta(days=buffer_days)
     result = await session.execute(
         text("""
             WITH trades AS (
@@ -68,7 +79,7 @@ async def build_dataset_fast(session: AsyncSession, limit: int = 20000) -> pd.Da
                 AND t.ticker != ''
                 AND t.transaction_date IS NOT NULL
                 AND t.transaction_date >= '2016-01-01'
-                AND t.transaction_date <= CURRENT_DATE - INTERVAL '8 days'
+                AND t.transaction_date <= :cutoff_date
                 ORDER BY t.transaction_date
                 LIMIT :limit
             )
@@ -76,10 +87,8 @@ async def build_dataset_fast(session: AsyncSession, limit: int = 20000) -> pd.Da
                 tr.*,
                 base.adj_close as base_price,
                 base.date as base_date,
-                future5.adj_close as price_5d,
-                future5.date as future_5d_date,
-                future21.adj_close as price_21d,
-                future21.date as future_21d_date
+                future.adj_close as price_future,
+                future.date as future_date
             FROM trades tr
             LEFT JOIN LATERAL (
                 SELECT adj_close, date FROM stock_daily
@@ -89,15 +98,10 @@ async def build_dataset_fast(session: AsyncSession, limit: int = 20000) -> pd.Da
             LEFT JOIN LATERAL (
                 SELECT adj_close, date FROM stock_daily
                 WHERE ticker = tr.ticker AND date > tr.transaction_date
-                ORDER BY date OFFSET 4 LIMIT 1
-            ) future5 ON true
-            LEFT JOIN LATERAL (
-                SELECT adj_close, date FROM stock_daily
-                WHERE ticker = tr.ticker AND date > tr.transaction_date
-                ORDER BY date OFFSET 20 LIMIT 1
-            ) future21 ON true
+                ORDER BY date OFFSET :offset LIMIT 1
+            ) future ON true
         """),
-        {"limit": limit},
+        {"offset": offset, "limit": limit, "cutoff_date": cutoff_date},
     )
     rows = result.fetchall()
     columns = result.keys()
@@ -108,43 +112,26 @@ async def build_dataset_fast(session: AsyncSession, limit: int = 20000) -> pd.Da
     if df.empty:
         return pd.DataFrame()
 
-    # Compute labels — both 5d and 21d
-    df["actual_return_5d"] = None
-    mask_5d = df["base_price"].notna() & df["price_5d"].notna() & (df["base_price"] > 0)
-    df.loc[mask_5d, "actual_return_5d"] = (
-        (df.loc[mask_5d, "price_5d"].astype(float) - df.loc[mask_5d, "base_price"].astype(float))
-        / df.loc[mask_5d, "base_price"].astype(float)
-    )
-
-    df["actual_return_21d"] = None
-    mask_21d = df["base_price"].notna() & df["price_21d"].notna() & (df["base_price"] > 0)
-    df.loc[mask_21d, "actual_return_21d"] = (
-        (df.loc[mask_21d, "price_21d"].astype(float) - df.loc[mask_21d, "base_price"].astype(float))
-        / df.loc[mask_21d, "base_price"].astype(float)
+    # Compute labels
+    df["actual_return"] = None
+    mask = df["base_price"].notna() & df["price_future"].notna() & (df["base_price"] > 0)
+    df.loc[mask, "actual_return"] = (
+        (df.loc[mask, "price_future"].astype(float) - df.loc[mask, "base_price"].astype(float))
+        / df.loc[mask, "base_price"].astype(float)
     )
 
     df["is_purchase"] = (df["transaction_type"] == "purchase").astype(float)
 
-    df["profitable_5d"] = None
-    ret_mask_5d = df["actual_return_5d"].notna()
-    df.loc[ret_mask_5d, "profitable_5d"] = (
-        ((df.loc[ret_mask_5d, "actual_return_5d"].astype(float) > 0) == (df.loc[ret_mask_5d, "is_purchase"] == 1.0))
+    df["profitable"] = None
+    ret_mask = df["actual_return"].notna()
+    df.loc[ret_mask, "profitable"] = (
+        ((df.loc[ret_mask, "actual_return"].astype(float) > 0) == (df.loc[ret_mask, "is_purchase"] == 1.0))
         .astype(float)
     )
 
-    df["profitable_21d"] = None
-    ret_mask_21d = df["actual_return_21d"].notna()
-    df.loc[ret_mask_21d, "profitable_21d"] = (
-        ((df.loc[ret_mask_21d, "actual_return_21d"].astype(float) > 0) == (df.loc[ret_mask_21d, "is_purchase"] == 1.0))
-        .astype(float)
-    )
-
-    # Drop rows without labels — use 21d as primary, fall back to 5d
-    df_21d = df.dropna(subset=["profitable_21d"])
-    df_5d = df.dropna(subset=["profitable_5d"])
-    logger.info("Labeled trades (5d): %d (%.1f%% profitable)", len(df_5d), df_5d["profitable_5d"].mean() * 100)
-    logger.info("Labeled trades (21d): %d (%.1f%% profitable)", len(df_21d), df_21d["profitable_21d"].mean() * 100)
-    df = df_21d  # Use 21d horizon for training
+    # Drop rows without labels
+    df = df.dropna(subset=["profitable"])
+    logger.info("Labeled trades (%s): %d (%.1f%% profitable)", horizon, len(df), df["profitable"].mean() * 100)
 
     # === Build features ===
 
@@ -204,7 +191,7 @@ async def build_dataset_fast(session: AsyncSession, limit: int = 20000) -> pd.Da
 
     # Member historical win rate — key feature for follow-the-smart-money
     logger.info("Computing member historical win rates...")
-    await _add_member_win_rate(session, df)
+    await _add_member_win_rate(session, df, horizon_offset=offset)
 
     logger.info("Dataset built: %d samples, %d features", len(df), len(_feature_cols(df)))
     return df
@@ -217,9 +204,8 @@ def _feature_cols(df: pd.DataFrame) -> list[str]:
         "transaction_type", "filer_type", "amount_range_low", "amount_range_high",
         "member_bioguide_id", "trade_chamber", "party", "member_chamber",
         "first_elected", "base_price", "base_date",
-        "price_5d", "future_5d_date", "price_21d", "future_21d_date",
-        "actual_return_5d", "actual_return_21d",
-        "profitable_5d", "profitable_21d", "is_purchase",
+        "price_future", "future_date",
+        "actual_return", "profitable", "is_purchase",
     }
     return [c for c in df.columns if c not in exclude]
 
@@ -400,7 +386,7 @@ async def _add_sentiment_features(session: AsyncSession, df: pd.DataFrame) -> No
     logger.info("  Sentiment data: %d dates with scores", len(sent_df))
 
 
-async def _add_member_win_rate(session: AsyncSession, df: pd.DataFrame) -> None:
+async def _add_member_win_rate(session: AsyncSession, df: pd.DataFrame, horizon_offset: int = 20) -> None:
     """Add member historical win rate as a feature.
 
     For each trade, compute the member's win rate from ALL their PRIOR trades
@@ -411,14 +397,15 @@ async def _add_member_win_rate(session: AsyncSession, df: pd.DataFrame) -> None:
     df["member_avg_return"] = 0.0
 
     # Get all trades sorted by date with their returns
-    r = await session.execute(text("""
+    r = await session.execute(
+        text("""
         SELECT
             t.id as trade_id,
             t.member_bioguide_id,
             t.transaction_type,
             t.transaction_date,
             base.adj_close as base_price,
-            f21.adj_close as price_21d
+            future.adj_close as price_future
         FROM trade_disclosure t
         LEFT JOIN LATERAL (
             SELECT adj_close FROM stock_daily
@@ -428,14 +415,16 @@ async def _add_member_win_rate(session: AsyncSession, df: pd.DataFrame) -> None:
         LEFT JOIN LATERAL (
             SELECT adj_close FROM stock_daily
             WHERE ticker = t.ticker AND date > t.transaction_date
-            ORDER BY date OFFSET 20 LIMIT 1
-        ) f21 ON true
+            ORDER BY date OFFSET :offset LIMIT 1
+        ) future ON true
         WHERE t.ticker IS NOT NULL AND t.ticker != ''
         AND t.transaction_date >= '2016-01-01'
         AND t.member_bioguide_id IS NOT NULL
         AND base.adj_close > 0
         ORDER BY t.transaction_date
-    """))
+    """),
+        {"offset": horizon_offset},
+    )
     all_trades = pd.DataFrame(r.fetchall(), columns=r.keys())
 
     if all_trades.empty:
@@ -446,16 +435,16 @@ async def _add_member_win_rate(session: AsyncSession, df: pd.DataFrame) -> None:
 
     # Pre-compute win for each historical trade
     all_trades["is_win"] = None
-    all_trades["return_21d"] = None
-    mask = all_trades["price_21d"].notna() & (all_trades["base_price"] > 0)
-    all_trades.loc[mask, "return_21d"] = (
-        (all_trades.loc[mask, "price_21d"].astype(float) - all_trades.loc[mask, "base_price"].astype(float))
+    all_trades["ret"] = None
+    mask = all_trades["price_future"].notna() & (all_trades["base_price"] > 0)
+    all_trades.loc[mask, "ret"] = (
+        (all_trades.loc[mask, "price_future"].astype(float) - all_trades.loc[mask, "base_price"].astype(float))
         / all_trades.loc[mask, "base_price"].astype(float)
     )
-    ret_mask = all_trades["return_21d"].notna()
+    ret_mask = all_trades["ret"].notna()
     is_purchase = all_trades["transaction_type"] == "purchase"
     all_trades.loc[ret_mask, "is_win"] = (
-        ((all_trades.loc[ret_mask, "return_21d"].astype(float) > 0) == is_purchase[ret_mask])
+        ((all_trades.loc[ret_mask, "ret"].astype(float) > 0) == is_purchase[ret_mask])
         .astype(float)
     )
 
@@ -481,8 +470,8 @@ async def _add_member_win_rate(session: AsyncSession, df: pd.DataFrame) -> None:
         if row["is_win"] is not None and not pd.isna(row["is_win"]):
             stats["total"] += 1
             stats["wins"] += int(row["is_win"])
-            if row["return_21d"] is not None and not pd.isna(row["return_21d"]):
-                stats["return_sum"] += float(row["return_21d"])
+            if row["ret"] is not None and not pd.isna(row["ret"]):
+                stats["return_sum"] += float(row["ret"])
 
     # Map back to our training DataFrame
     for idx, row in df.iterrows():
@@ -521,8 +510,8 @@ async def train_models(df: pd.DataFrame, session: AsyncSession) -> dict:
 
     feature_cols = _feature_cols(df)
     X = df[feature_cols].values.astype(float)
-    y_class = df["profitable_21d"].values.astype(float)
-    y_return = df["actual_return_21d"].fillna(0).values.astype(float)
+    y_class = df["profitable"].values.astype(float)
+    y_return = df["actual_return"].fillna(0).values.astype(float)
 
     # Replace NaN
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -635,21 +624,41 @@ async def _save(session, model, version, metrics, feature_cols):
 
 
 async def main():
-    async with async_session_factory() as session:
-        df = await build_dataset_fast(session, limit=20000)
-        if df.empty:
-            logger.error("No training data!")
-            return
+    import sys
+    # Parse horizons from CLI args: python -m scripts.train_models 5d 21d 63d 90d
+    horizons = [a for a in sys.argv[1:] if a in ("5d", "21d", "63d", "90d")]
+    if not horizons:
+        horizons = ["21d", "63d", "90d"]
 
-        results = await train_models(df, session)
+    all_results: dict[str, dict] = {}
 
-        print("\n" + "=" * 50)
-        print("TRAINING RESULTS")
-        print("=" * 50)
+    for horizon in horizons:
+        print(f"\n{'='*60}")
+        print(f"  HORIZON: {horizon}")
+        print(f"{'='*60}")
+
+        async with async_session_factory() as session:
+            df = await build_dataset_fast(session, limit=20000, horizon=horizon)
+            if df.empty:
+                logger.error("No training data for horizon %s!", horizon)
+                continue
+
+            results = await train_models(df, session)
+            all_results[horizon] = results
+
+    # Print comparison table
+    print("\n" + "=" * 70)
+    print("  HORIZON COMPARISON")
+    print("=" * 70)
+    print(f"  {'Model':<25s} {'Horizon':<10s} {'Accuracy':>10s} {'AUC':>10s} {'F1':>10s}")
+    print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+
+    for horizon, results in all_results.items():
         for model_name, metrics in results.items():
-            print(f"\n{model_name}:")
-            for k, v in sorted(metrics.items()):
-                print(f"  {k:25s} {v:.4f}")
+            if "accuracy" in metrics:
+                print(f"  {model_name:<25s} {horizon:<10s} {metrics.get('accuracy', 0):>10.4f} {metrics.get('auc', 0):>10.4f} {metrics.get('f1', 0):>10.4f}")
+            elif "mae" in metrics:
+                print(f"  {model_name:<25s} {horizon:<10s} {'MAE:':>10s} {metrics.get('mae', 0):>10.4f} {metrics.get('r2', 0):>10.4f}")
 
 
 if __name__ == "__main__":
