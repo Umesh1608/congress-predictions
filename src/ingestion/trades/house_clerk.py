@@ -183,16 +183,25 @@ class HouseClerkCollector(BaseCollector):
     source_name = "house_clerk"
     rate_limiter = _house_clerk_rate_limiter
 
-    def __init__(self, years: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        years: list[int] | None = None,
+        skip_urls: set[str] | None = None,
+    ) -> None:
         super().__init__()
         if years is None:
-            # Default to current year only to keep initial seed fast
             self.years = [date.today().year]
         else:
             self.years = years
+        # URLs to skip (already processed). Enables incremental collection.
+        self._skip_urls = skip_urls or set()
 
     async def collect(self) -> list[dict[str, Any]]:
-        """Search for all PTR filings and download/parse PDFs concurrently."""
+        """Search for all PTR filings and download/parse PDFs concurrently.
+
+        Uses a semaphore to bound concurrency and processes filings in
+        chunks of 200 to avoid creating thousands of pending tasks at once.
+        """
         all_trades: list[dict[str, Any]] = []
         semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
 
@@ -200,42 +209,63 @@ class HouseClerkCollector(BaseCollector):
             logger.info("[%s] Fetching PTR filings for %d", self.source_name, year)
             filings = await self._search_filings(year)
             ptr_filings = [f for f in filings if "PTR" in f.get("filing_type", "")]
-            logger.info(
-                "[%s] Found %d PTR filings for %d",
-                self.source_name, len(ptr_filings), year,
-            )
 
-            async def _process_filing(
-                filing: dict[str, str], _sem: asyncio.Semaphore = semaphore
-            ) -> list[dict[str, Any]]:
-                pdf_url = filing.get("pdf_url", "")
-                if not pdf_url:
-                    return []
-                async with _sem:
-                    try:
-                        if self.rate_limiter:
-                            await self.rate_limiter.acquire()
-                        return await self._download_and_parse_ptr(
-                            pdf_url, filing.get("name", ""),
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            "[%s] Failed to parse PDF %s: %s",
-                            self.source_name, pdf_url, e,
-                        )
-                        return []
+            # Skip already-processed PDFs (incremental mode)
+            if self._skip_urls:
+                before = len(ptr_filings)
+                ptr_filings = [
+                    f for f in ptr_filings if f.get("pdf_url", "") not in self._skip_urls
+                ]
+                logger.info(
+                    "[%s] %d PTR filings for %d (%d new, %d already processed)",
+                    self.source_name, before, year,
+                    len(ptr_filings), before - len(ptr_filings),
+                )
+            else:
+                logger.info(
+                    "[%s] Found %d PTR filings for %d",
+                    self.source_name, len(ptr_filings), year,
+                )
 
-            results = await asyncio.gather(
-                *[_process_filing(f) for f in ptr_filings]
-            )
-            for trades in results:
-                all_trades.extend(trades)
+            # Process in chunks of 200 with semaphore-bounded concurrency
+            chunk_size = 200
+            for chunk_start in range(0, len(ptr_filings), chunk_size):
+                chunk = ptr_filings[chunk_start:chunk_start + chunk_size]
+                tasks = []
+                for filing in chunk:
+                    pdf_url = filing.get("pdf_url", "")
+                    if not pdf_url:
+                        continue
+                    tasks.append(self._safe_download(pdf_url, filing.get("name", ""), semaphore))
+
+                results = await asyncio.gather(*tasks)
+                for trades in results:
+                    all_trades.extend(trades)
+
+                processed = min(chunk_start + chunk_size, len(ptr_filings))
+                logger.info(
+                    "[%s] Progress for %d: %d/%d filings processed, %d trades so far",
+                    self.source_name, year, processed, len(ptr_filings), len(all_trades),
+                )
 
         logger.info(
             "[%s] Extracted %d total trades from PDFs",
             self.source_name, len(all_trades),
         )
         return all_trades
+
+    async def _safe_download(
+        self, pdf_url: str, member_name: str, semaphore: asyncio.Semaphore,
+    ) -> list[dict[str, Any]]:
+        """Download and parse a single PDF with semaphore, rate limiting, and error handling."""
+        async with semaphore:
+            try:
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+                return await self._download_and_parse_ptr(pdf_url, member_name)
+            except Exception as e:
+                logger.debug("[%s] Failed to parse PDF %s: %s", self.source_name, pdf_url, e)
+                return []
 
     async def _search_filings(self, year: int) -> list[dict[str, str]]:
         """Search the House clerk for all filings in a given year."""
@@ -302,6 +332,8 @@ class HouseClerkCollector(BaseCollector):
             full_text = ""
             for page in reader.pages:
                 full_text += page.extract_text() + "\n"
+            # Strip null bytes — some PDFs extract with \x00 which PostgreSQL rejects
+            full_text = full_text.replace("\x00", "")
         except Exception as e:
             logger.debug("[%s] PDF parsing error for %s: %s", self.source_name, pdf_url, e)
             return []
@@ -356,11 +388,19 @@ class HouseClerkCollector(BaseCollector):
         if not member_name:
             return None
 
+        asset_name = (raw.get("asset_name") or "").strip().replace("\x00", "")
+
+        # Sanitize raw_data: strip null bytes from all string values
+        clean_raw = {
+            k: v.replace("\x00", "") if isinstance(v, str) else v
+            for k, v in raw.items()
+        }
+
         return {
             "member_name": member_name,
             "filer_type": filer_type,
             "ticker": ticker,
-            "asset_name": (raw.get("asset_name") or "").strip(),
+            "asset_name": asset_name,
             "asset_type": "Stock" if ticker else None,
             "transaction_type": tx_type,
             "transaction_date": transaction_date,
@@ -370,7 +410,7 @@ class HouseClerkCollector(BaseCollector):
             "chamber": "house",
             "source": self.source_name,
             "filing_url": raw.get("pdf_url"),
-            "raw_data": raw,
+            "raw_data": clean_raw,
         }
 
     @staticmethod

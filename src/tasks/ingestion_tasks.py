@@ -36,14 +36,33 @@ async def _run_collector(collector_cls):
 
 @celery_app.task(name="src.tasks.ingestion_tasks.collect_house_trades")
 def collect_house_trades():
-    """Collect House trades: try S3 watcher first, fall back to House Clerk scraper."""
+    """Collect House trades: try S3 watcher first, fall back to incremental House Clerk."""
     try:
         from src.ingestion.trades.house_watcher import HouseWatcherCollector
         asyncio.run(_run_collector(HouseWatcherCollector))
     except Exception as e:
         logger.warning("House Watcher S3 failed (%s), falling back to House Clerk scraper", e)
+        # Use incremental mode for fallback too
         from src.ingestion.trades.house_clerk import HouseClerkCollector
-        asyncio.run(_run_collector(HouseClerkCollector))
+        from src.ingestion.loader import upsert_trades, get_existing_filing_urls
+
+        async def _run_incremental():
+            factory, engine = _get_async_session()
+            try:
+                async with factory() as session:
+                    existing = await get_existing_filing_urls(session, "house_clerk")
+                collector = HouseClerkCollector(skip_urls=existing)
+                try:
+                    records = await collector.run()
+                    async with factory() as session:
+                        count = await upsert_trades(session, records)
+                        logger.info("[house_clerk] Inserted %d new records", count)
+                finally:
+                    await collector.close()
+            finally:
+                await engine.dispose()
+
+        asyncio.run(_run_incremental())
 
 
 @celery_app.task(name="src.tasks.ingestion_tasks.collect_senate_trades")
@@ -60,8 +79,29 @@ def collect_senate_trades():
 
 @celery_app.task(name="src.tasks.ingestion_tasks.collect_house_clerk_trades")
 def collect_house_clerk_trades():
+    """Incremental House Clerk collection — only downloads new PDFs."""
     from src.ingestion.trades.house_clerk import HouseClerkCollector
-    asyncio.run(_run_collector(HouseClerkCollector))
+    from src.ingestion.loader import upsert_trades, get_existing_filing_urls
+
+    async def _run():
+        factory, engine = _get_async_session()
+        try:
+            async with factory() as session:
+                existing = await get_existing_filing_urls(session, "house_clerk")
+            logger.info("House Clerk: %d existing filing URLs, skipping those", len(existing))
+
+            collector = HouseClerkCollector(skip_urls=existing)
+            try:
+                records = await collector.run()
+                async with factory() as session:
+                    count = await upsert_trades(session, records)
+                    logger.info("[house_clerk] Inserted %d new records", count)
+            finally:
+                await collector.close()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
 
 
 @celery_app.task(name="src.tasks.ingestion_tasks.collect_fmp_house_trades")

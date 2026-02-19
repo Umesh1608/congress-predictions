@@ -69,6 +69,17 @@ async def get_unique_tickers(session: AsyncSession) -> list[str]:
     return [row[0] for row in result.all()]
 
 
+async def get_existing_filing_urls(session: AsyncSession, source: str) -> set[str]:
+    """Get all filing_url values for a given source. Used for incremental collection."""
+    result = await session.execute(
+        select(TradeDisclosure.filing_url)
+        .where(TradeDisclosure.source == source)
+        .where(TradeDisclosure.filing_url.is_not(None))
+        .distinct()
+    )
+    return {row[0] for row in result.all()}
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Legislation loaders
 # ---------------------------------------------------------------------------
