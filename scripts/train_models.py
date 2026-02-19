@@ -41,12 +41,12 @@ TX_DIR_MAP = {"purchase": 1, "sale": -1, "sale_full": -1, "sale_partial": -1, "e
 async def build_dataset_fast(session: AsyncSession, limit: int = 20000, horizon: str = "21d") -> pd.DataFrame:
     """Build training dataset using bulk SQL — 100x faster than per-trade queries.
 
-    horizon: "5d", "21d", "63d", or "90d"
+    horizon: "5d", "21d", "63d", "90d", or "180d"
     """
     # Map horizon to trading-day offset
-    HORIZON_OFFSETS = {"5d": 4, "21d": 20, "63d": 62, "90d": 89}
+    HORIZON_OFFSETS = {"5d": 4, "21d": 20, "63d": 62, "90d": 89, "180d": 179}
     # Days of calendar buffer needed for the horizon + some safety margin
-    HORIZON_BUFFER = {"5d": 10, "21d": 35, "63d": 100, "90d": 140}
+    HORIZON_BUFFER = {"5d": 10, "21d": 35, "63d": 100, "90d": 140, "180d": 270}
 
     offset = HORIZON_OFFSETS.get(horizon, 20)
     buffer_days = HORIZON_BUFFER.get(horizon, 35)
@@ -504,8 +504,13 @@ def _compute_rsi(prices, period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
-async def train_models(df: pd.DataFrame, session: AsyncSession) -> dict:
-    """Train all models on the dataset."""
+async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5) -> dict:
+    """Train all models with temporal k-fold cross-validation.
+
+    Data is sorted by transaction_date. For k folds, each fold uses
+    the first (i+1)/k of data for training and the next chunk for validation.
+    This ensures no future leakage — always train on past, test on future.
+    """
     from sqlalchemy import update as sa_update
 
     feature_cols = _feature_cols(df)
@@ -517,80 +522,140 @@ async def train_models(df: pd.DataFrame, session: AsyncSession) -> dict:
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     n = len(X)
+    logger.info("Features (%d): %s", len(feature_cols), feature_cols)
+    logger.info("Running %d-fold temporal cross-validation on %d samples", n_folds, n)
+
+    # Temporal CV: fold i trains on [0, split_i), validates on [split_i, split_i+1)
+    # The minimum training size is 40% of data; folds expand from there
+    min_train_frac = 0.4
+    fold_size = int(n * (1 - min_train_frac) / n_folds)
+
+    fold_metrics: dict[str, list[dict]] = {
+        "trade_predictor": [], "return_predictor": [],
+        "anomaly_detector": [], "ensemble": [],
+    }
+
+    for fold in range(n_folds):
+        train_end = int(n * min_train_frac) + fold * fold_size
+        val_end = min(train_end + fold_size, n)
+        if train_end >= n or val_end <= train_end:
+            break
+
+        X_train, X_val = X[:train_end], X[train_end:val_end]
+        y_class_train, y_class_val = y_class[:train_end], y_class[train_end:val_end]
+        y_return_train, y_return_val = y_return[:train_end], y_return[train_end:val_end]
+
+        logger.info("  Fold %d/%d: train=%d, val=%d (dates: train to idx %d, val to idx %d)",
+                     fold + 1, n_folds, len(X_train), len(X_val), train_end, val_end)
+
+        # Trade Predictor
+        tp = TradePredictor()
+        tp.feature_columns = feature_cols
+        tp.train(X_train, y_class_train, X_val, y_class_val)
+        m = evaluate_classifier(y_class_val, tp.predict(X_val), tp.predict_proba(X_val))
+        fold_metrics["trade_predictor"].append(m)
+
+        # Return Predictor
+        rp = ReturnPredictor()
+        rp.feature_columns = feature_cols
+        rp.train(X_train, y_return_train, X_val, y_return_val)
+        m = evaluate_regressor(y_return_val, rp.predict(X_val))
+        fold_metrics["return_predictor"].append(m)
+
+        # Anomaly Detector
+        anomaly_cols = [c for c in feature_cols if c not in AnomalyDetector.EXCLUDED_FEATURES]
+        anomaly_idx = [feature_cols.index(c) for c in anomaly_cols]
+        X_a_train = X_train[:, anomaly_idx]
+        ad = AnomalyDetector()
+        ad.feature_columns = anomaly_cols
+        m = ad.train(X_a_train, y_class_train)
+        fold_metrics["anomaly_detector"].append(m)
+
+        # Ensemble
+        tp_proba = np.concatenate([tp.predict_proba(X_train), tp.predict_proba(X_val)])
+        rp_scores = np.concatenate([rp.predict(X_train), rp.predict(X_val)])
+        X_a_all = np.vstack([X_a_train, X_val[:, anomaly_idx]])
+        ad_scores = ad.predict_proba(X_a_all)
+
+        timing_idx = feature_cols.index("timing_suspicion_score") if "timing_suspicion_score" in feature_cols else None
+        sentiment_idx = feature_cols.index("avg_sentiment_7d") if "avg_sentiment_7d" in feature_cols else None
+        all_X = np.vstack([X_train, X_val])
+
+        meta = np.column_stack([
+            tp_proba, rp_scores, ad_scores,
+            all_X[:, timing_idx] if timing_idx is not None else np.zeros(len(all_X)),
+            all_X[:, sentiment_idx] if sentiment_idx is not None else np.zeros(len(all_X)),
+        ])
+        meta_train, meta_val = meta[:len(X_train)], meta[len(X_train):]
+        ens = EnsembleModel()
+        ens.feature_columns = EnsembleModel.META_FEATURES
+        ens.train(meta_train, y_class_train, meta_val, y_class_val)
+        m = evaluate_classifier(y_class_val, ens.predict(meta_val), ens.predict_proba(meta_val))
+        fold_metrics["ensemble"].append(m)
+
+    # Average metrics across folds
+    results = {}
+    for model_name, folds in fold_metrics.items():
+        if not folds:
+            continue
+        avg = {}
+        for key in folds[0]:
+            vals = [f[key] for f in folds if key in f and f[key] is not None]
+            if vals:
+                avg[key] = float(np.mean(vals))
+                avg[f"{key}_std"] = float(np.std(vals))
+        results[model_name] = avg
+
+    # Log CV results
+    for model_name, metrics in results.items():
+        if "accuracy" in metrics:
+            logger.info("  %s (CV avg): accuracy=%.4f±%.4f, AUC=%.4f±%.4f, F1=%.4f±%.4f",
+                        model_name,
+                        metrics.get("accuracy", 0), metrics.get("accuracy_std", 0),
+                        metrics.get("auc", 0), metrics.get("auc_std", 0),
+                        metrics.get("f1", 0), metrics.get("f1_std", 0))
+
+    # Final train on all data except last 20% for saving the best model
     split_idx = int(n * 0.8)
     X_train, X_val = X[:split_idx], X[split_idx:]
     y_class_train, y_class_val = y_class[:split_idx], y_class[split_idx:]
     y_return_train, y_return_val = y_return[:split_idx], y_return[split_idx:]
 
-    logger.info("Train set: %d samples, Val set: %d samples", len(X_train), len(X_val))
-    logger.info("Features (%d): %s", len(feature_cols), feature_cols)
-
     version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    results = {}
 
-    # 1. Trade Predictor (LightGBM)
-    logger.info("Training TradePredictor (LightGBM)...")
+    # Save final models
     trade_pred = TradePredictor()
     trade_pred.feature_columns = feature_cols
     trade_pred.train(X_train, y_class_train, X_val, y_class_val)
-    val_preds = trade_pred.predict(X_val)
-    val_proba = trade_pred.predict_proba(X_val)
-    metrics = evaluate_classifier(y_class_val, val_preds, val_proba)
-    results["trade_predictor"] = metrics
-    await _save(session, trade_pred, version, metrics, feature_cols)
-    logger.info("  TradePredictor: accuracy=%.4f, AUC=%.4f, F1=%.4f", metrics["accuracy"], metrics["auc"], metrics["f1"])
+    await _save(session, trade_pred, version, results["trade_predictor"], feature_cols)
 
-    # 2. Return Predictor (XGBoost)
-    logger.info("Training ReturnPredictor (XGBoost)...")
     return_pred = ReturnPredictor()
     return_pred.feature_columns = feature_cols
     return_pred.train(X_train, y_return_train, X_val, y_return_val)
-    val_preds = return_pred.predict(X_val)
-    metrics = evaluate_regressor(y_return_val, val_preds)
-    results["return_predictor"] = metrics
-    await _save(session, return_pred, version, metrics, feature_cols)
-    logger.info("  ReturnPredictor: MAE=%.4f, RMSE=%.4f, R2=%.4f", metrics["mae"], metrics["rmse"], metrics["r2"])
+    await _save(session, return_pred, version, results["return_predictor"], feature_cols)
 
-    # 3. Anomaly Detector
-    logger.info("Training AnomalyDetector (Isolation Forest)...")
     anomaly_cols = [c for c in feature_cols if c not in AnomalyDetector.EXCLUDED_FEATURES]
     anomaly_idx = [feature_cols.index(c) for c in anomaly_cols]
-    X_anomaly = X[:, anomaly_idx]
     anomaly_det = AnomalyDetector()
     anomaly_det.feature_columns = anomaly_cols
-    metrics = anomaly_det.train(X_anomaly, y_class)
-    results["anomaly_detector"] = metrics
-    await _save(session, anomaly_det, version, metrics, anomaly_cols)
-    logger.info("  AnomalyDetector: anomaly_rate=%.4f", metrics.get("anomaly_rate", 0))
+    anomaly_det.train(X[:, anomaly_idx], y_class)
+    await _save(session, anomaly_det, version, results["anomaly_detector"], anomaly_cols)
 
-    # 4. Ensemble
-    logger.info("Training Ensemble (Logistic Regression meta-learner)...")
-    trade_proba_all = trade_pred.predict_proba(X)
-    return_scores_all = return_pred.predict(X)
-    anomaly_scores_all = anomaly_det.predict_proba(X_anomaly)
-
+    # Ensemble on final split
+    tp_proba = trade_pred.predict_proba(X)
+    rp_scores = return_pred.predict(X)
+    ad_scores = anomaly_det.predict_proba(X[:, anomaly_idx])
     timing_idx = feature_cols.index("timing_suspicion_score") if "timing_suspicion_score" in feature_cols else None
     sentiment_idx = feature_cols.index("avg_sentiment_7d") if "avg_sentiment_7d" in feature_cols else None
-
-    meta_features = np.column_stack([
-        trade_proba_all,
-        return_scores_all,
-        anomaly_scores_all,
+    meta = np.column_stack([
+        tp_proba, rp_scores, ad_scores,
         X[:, timing_idx] if timing_idx is not None else np.zeros(n),
         X[:, sentiment_idx] if sentiment_idx is not None else np.zeros(n),
     ])
-
-    meta_train, meta_val = meta_features[:split_idx], meta_features[split_idx:]
-
     ensemble = EnsembleModel()
     ensemble.feature_columns = EnsembleModel.META_FEATURES
-    ensemble.train(meta_train, y_class_train, meta_val, y_class_val)
-    val_preds = ensemble.predict(meta_val)
-    val_proba = ensemble.predict_proba(meta_val)
-    metrics = evaluate_classifier(y_class_val, val_preds, val_proba)
-    results["ensemble"] = metrics
-    await _save(session, ensemble, version, metrics, EnsembleModel.META_FEATURES)
-    logger.info("  Ensemble: accuracy=%.4f, AUC=%.4f, F1=%.4f", metrics["accuracy"], metrics["auc"], metrics["f1"])
+    ensemble.train(meta[:split_idx], y_class_train, meta[split_idx:], y_class_val)
+    await _save(session, ensemble, version, results["ensemble"], EnsembleModel.META_FEATURES)
 
     return results
 
@@ -626,9 +691,9 @@ async def _save(session, model, version, metrics, feature_cols):
 async def main():
     import sys
     # Parse horizons from CLI args: python -m scripts.train_models 5d 21d 63d 90d
-    horizons = [a for a in sys.argv[1:] if a in ("5d", "21d", "63d", "90d")]
+    horizons = [a for a in sys.argv[1:] if a in ("5d", "21d", "63d", "90d", "180d")]
     if not horizons:
-        horizons = ["21d", "63d", "90d"]
+        horizons = ["21d", "63d", "90d", "180d"]
 
     all_results: dict[str, dict] = {}
 
