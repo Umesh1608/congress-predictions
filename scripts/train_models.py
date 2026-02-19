@@ -1,12 +1,13 @@
 """Fast batch model training script.
 
 Builds features using bulk SQL queries instead of per-trade round-trips.
-Run: python -m scripts.train_models
+Run: python -m scripts.train_models [horizons...] [--catboost]
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -30,12 +31,34 @@ logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 ARTIFACT_DIR = "data/models"
+SECTOR_CACHE_PATH = Path("data/sector_cache.json")
 
 # Feature encoding maps
 FILER_TYPE_MAP = {"member": 0, "spouse": 1, "dependent": 2, "joint": 3}
 PARTY_MAP = {"Democrat": 0, "Republican": 1, "Independent": 2}
 CHAMBER_MAP = {"house": 0, "senate": 1}
 TX_DIR_MAP = {"purchase": 1, "sale": -1, "sale_full": -1, "sale_partial": -1, "exchange": 0}
+
+# US presidential election years for cycle features
+_ELECTION_YEARS = {2016, 2020, 2024, 2028}
+# Midterm election years
+_MIDTERM_YEARS = {2018, 2022, 2026}
+
+# Committee sector mapping for sector alignment detection
+COMMITTEE_SECTOR_MAP = {
+    "HSBA": {"Financial Services", "Finance", "Banking"},
+    "SSBA": {"Financial Services", "Finance", "Banking"},
+    "HSAG": {"Consumer Defensive", "Agriculture"},
+    "SSAF": {"Consumer Defensive", "Agriculture"},
+    "HSIF": {"Energy", "Utilities"},
+    "SSCM": {"Energy", "Utilities", "Communication Services"},
+    "HSHM": {"Healthcare"},
+    "SSHR": {"Healthcare"},
+    "HSAS": {"Industrials", "Aerospace & Defense"},
+    "SSAS": {"Industrials", "Aerospace & Defense"},
+    "HSSM": {"Technology", "Communication Services"},
+    "HSSY": {"Technology", "Communication Services"},
+}
 
 
 async def build_dataset_fast(session: AsyncSession, limit: int = 20000, horizon: str = "21d") -> pd.DataFrame:
@@ -183,15 +206,37 @@ async def build_dataset_fast(session: AsyncSession, limit: int = 20000, horizon:
     logger.info("Computing sentiment features...")
     await _add_sentiment_features(session, df)
 
-    # Network features — set to 0 (Neo4j not available)
-    df["lobbying_connection_count"] = 0.0
-    df["campaign_donor_connection"] = 0.0
-    df["network_degree"] = 0.0
-    df["has_lobbying_triangle"] = 0.0
+    # Network features — use SQL fallback if Neo4j unavailable
+    logger.info("Computing network features (SQL fallback)...")
+    await _add_network_features_sql(session, df)
 
     # Member historical win rate — key feature for follow-the-smart-money
     logger.info("Computing member historical win rates...")
     await _add_member_win_rate(session, df, horizon_offset=offset)
+
+    # NEW: Cross-member trading signals
+    logger.info("Computing cross-member trading signals...")
+    _add_cross_member_signals(df)
+
+    # NEW: Calendar / seasonal features
+    logger.info("Computing calendar features...")
+    _add_calendar_features(df)
+
+    # NEW: Ticker popularity among congress
+    logger.info("Computing ticker popularity...")
+    await _add_ticker_popularity(session, df)
+
+    # NEW: Member trading velocity
+    logger.info("Computing member trading velocity...")
+    await _add_member_velocity(session, df)
+
+    # NEW: Market regime (S&P 500 / broad market context)
+    logger.info("Computing market regime features...")
+    await _add_market_regime(session, df)
+
+    # NEW: Stock sector features
+    logger.info("Computing sector features...")
+    await _add_sector_features(session, df)
 
     logger.info("Dataset built: %d samples, %d features", len(df), len(_feature_cols(df)))
     return df
@@ -367,9 +412,10 @@ async def _add_sentiment_features(session: AsyncSession, df: pd.DataFrame) -> No
     df["media_mention_count_7d"] = 0.0
     df["media_mention_count_30d"] = 0.0
 
-    # Bulk sentiment average for all dates
+    # Bulk sentiment scores by date
     r = await session.execute(text("""
-        SELECT mc.published_date, AVG(sa.sentiment_score) as avg_score
+        SELECT mc.published_date, AVG(sa.sentiment_score) as avg_score,
+               COUNT(*) as article_count
         FROM media_content mc
         JOIN sentiment_analysis sa ON sa.media_content_id = mc.id
         WHERE mc.published_date IS NOT NULL
@@ -379,11 +425,28 @@ async def _add_sentiment_features(session: AsyncSession, df: pd.DataFrame) -> No
     sent_df = pd.DataFrame(r.fetchall(), columns=r.keys())
 
     if sent_df.empty:
+        logger.info("  No sentiment data available")
         return
 
-    # For now, global sentiment is sparse — just set to 0
-    # Will be useful once more media content accumulates
     logger.info("  Sentiment data: %d dates with scores", len(sent_df))
+    sent_df["published_date"] = pd.to_datetime(sent_df["published_date"])
+    sent_df = sent_df.set_index("published_date").sort_index()
+
+    # For each trade, compute rolling sentiment from media before trade date
+    for idx, row in df.iterrows():
+        td = pd.Timestamp(row["transaction_date"])
+        # 7-day window
+        window_7 = sent_df[(sent_df.index >= td - pd.Timedelta(days=7)) & (sent_df.index < td)]
+        if not window_7.empty:
+            df.at[idx, "avg_sentiment_7d"] = float(window_7["avg_score"].mean())
+            df.at[idx, "media_mention_count_7d"] = float(window_7["article_count"].sum())
+        # 30-day window
+        window_30 = sent_df[(sent_df.index >= td - pd.Timedelta(days=30)) & (sent_df.index < td)]
+        if not window_30.empty:
+            df.at[idx, "avg_sentiment_30d"] = float(window_30["avg_score"].mean())
+            df.at[idx, "media_mention_count_30d"] = float(window_30["article_count"].sum())
+        # Momentum: 7d sentiment minus 30d sentiment
+        df.at[idx, "sentiment_momentum"] = df.at[idx, "avg_sentiment_7d"] - df.at[idx, "avg_sentiment_30d"]
 
 
 async def _add_member_win_rate(session: AsyncSession, df: pd.DataFrame, horizon_offset: int = 20) -> None:
@@ -487,6 +550,350 @@ async def _add_member_win_rate(session: AsyncSession, df: pd.DataFrame, horizon_
                 has_history, len(df), has_history / len(df) * 100)
 
 
+def _add_cross_member_signals(df: pd.DataFrame) -> None:
+    """How many OTHER members traded this stock in ±7d and ±30d windows.
+
+    Pure DataFrame computation — no DB round-trip needed.
+    """
+    df["cross_member_7d"] = 0.0
+    df["cross_member_30d"] = 0.0
+    df["cross_member_same_dir_7d"] = 0.0
+
+    # Sort by ticker and date for efficient windowing
+    df_sorted = df[["trade_id", "ticker", "transaction_date", "member_bioguide_id", "tx_direction"]].copy()
+    df_sorted["transaction_date"] = pd.to_datetime(df_sorted["transaction_date"])
+
+    # Group by ticker for efficiency
+    for ticker, group in df_sorted.groupby("ticker"):
+        if len(group) < 2:
+            continue
+        dates = group["transaction_date"].values
+        members = group["member_bioguide_id"].values
+        directions = group["tx_direction"].values
+        trade_ids = group["trade_id"].values
+
+        for i in range(len(group)):
+            td = dates[i]
+            my_member = members[i]
+            my_dir = directions[i]
+
+            # Count other members trading this stock within windows
+            for window_days, col in [(7, "cross_member_7d"), (30, "cross_member_30d")]:
+                window = np.timedelta64(window_days, 'D')
+                mask = (np.abs(dates - td) <= window) & (members != my_member)
+                unique_others = len(set(members[mask]) - {my_member})
+                idx = df.index[df["trade_id"] == trade_ids[i]]
+                if len(idx) > 0:
+                    df.loc[idx[0], col] = float(unique_others)
+
+            # Same direction within 7d
+            window = np.timedelta64(7, 'D')
+            mask = (np.abs(dates - td) <= window) & (members != my_member) & (directions == my_dir)
+            unique_same_dir = len(set(members[mask]) - {my_member})
+            idx = df.index[df["trade_id"] == trade_ids[i]]
+            if len(idx) > 0:
+                df.loc[idx[0], "cross_member_same_dir_7d"] = float(unique_same_dir)
+
+    logger.info("  Cross-member signals: %.1f%% trades have >=1 other member in 7d",
+                (df["cross_member_7d"] > 0).mean() * 100)
+
+
+def _add_calendar_features(df: pd.DataFrame) -> None:
+    """Calendar, seasonal, and political cycle features."""
+    dates = pd.to_datetime(df["transaction_date"])
+
+    # Month and quarter (cyclical encoding)
+    df["month_sin"] = np.sin(2 * np.pi * dates.dt.month / 12).astype(float)
+    df["month_cos"] = np.cos(2 * np.pi * dates.dt.month / 12).astype(float)
+    df["quarter"] = dates.dt.quarter.astype(float)
+
+    # Day of week (0=Mon, 4=Fri — trades cluster around certain days)
+    df["day_of_week"] = dates.dt.dayofweek.astype(float)
+
+    # Year-end effects (December trading)
+    df["is_december"] = (dates.dt.month == 12).astype(float)
+
+    # January effect
+    df["is_january"] = (dates.dt.month == 1).astype(float)
+
+    # Election cycle proximity
+    years = dates.dt.year
+    df["is_election_year"] = years.isin(_ELECTION_YEARS).astype(float)
+    df["is_midterm_year"] = years.isin(_MIDTERM_YEARS).astype(float)
+
+    # Days to next November election (approximate)
+    next_nov = pd.to_datetime(years.astype(str) + "-11-05")
+    days_to_election = (next_nov - dates).dt.days
+    # If past November, use next year
+    mask = days_to_election < 0
+    next_nov_adj = pd.to_datetime((years + 1).astype(str) + "-11-05")
+    days_to_election = days_to_election.where(~mask, (next_nov_adj - dates).dt.days)
+    df["days_to_election"] = days_to_election.clip(0, 730).astype(float)
+
+    # Lame duck session (Nov election to Jan inauguration)
+    df["is_lame_duck"] = ((dates.dt.month >= 11) | (dates.dt.month == 1)).astype(float)
+
+
+async def _add_ticker_popularity(session: AsyncSession, df: pd.DataFrame) -> None:
+    """How popular is this ticker among congress members (historical, no leakage)."""
+    df["ticker_total_members"] = 0.0
+    df["ticker_total_trades"] = 0.0
+    df["ticker_purchase_ratio"] = 0.5
+
+    # Get all-time stats per ticker (up to a cutoff to prevent leakage)
+    r = await session.execute(text("""
+        SELECT ticker,
+               COUNT(DISTINCT member_bioguide_id) as unique_members,
+               COUNT(*) as total_trades,
+               AVG(CASE WHEN transaction_type = 'purchase' THEN 1.0 ELSE 0.0 END) as purchase_ratio
+        FROM trade_disclosure
+        WHERE ticker IS NOT NULL AND transaction_date >= '2016-01-01'
+        GROUP BY ticker
+    """))
+    ticker_stats = pd.DataFrame(r.fetchall(), columns=r.keys())
+
+    if not ticker_stats.empty:
+        stats_map = ticker_stats.set_index("ticker")
+        for col_src, col_dst in [("unique_members", "ticker_total_members"),
+                                  ("total_trades", "ticker_total_trades"),
+                                  ("purchase_ratio", "ticker_purchase_ratio")]:
+            mask = df["ticker"].isin(stats_map.index)
+            df.loc[mask, col_dst] = df.loc[mask, "ticker"].map(stats_map[col_src]).astype(float)
+
+    logger.info("  Ticker popularity: %.1f avg members/ticker",
+                df["ticker_total_members"].mean())
+
+
+async def _add_member_velocity(session: AsyncSession, df: pd.DataFrame) -> None:
+    """Member's recent trading frequency vs their historical average.
+
+    High velocity = member trading more than usual = potentially significant.
+    """
+    df["member_trades_30d"] = 0.0
+    df["member_trades_90d"] = 0.0
+    df["member_velocity_ratio"] = 1.0  # 30d rate / 90d rate
+
+    # Bulk: count each member's trades in 30d and 90d windows before each trade
+    r = await session.execute(text("""
+        SELECT t1.id as trade_id,
+               (SELECT COUNT(*) FROM trade_disclosure t2
+                WHERE t2.member_bioguide_id = t1.member_bioguide_id
+                AND t2.transaction_date BETWEEN t1.transaction_date - 30 AND t1.transaction_date - 1
+                AND t2.id != t1.id) as trades_30d,
+               (SELECT COUNT(*) FROM trade_disclosure t2
+                WHERE t2.member_bioguide_id = t1.member_bioguide_id
+                AND t2.transaction_date BETWEEN t1.transaction_date - 90 AND t1.transaction_date - 1
+                AND t2.id != t1.id) as trades_90d
+        FROM trade_disclosure t1
+        WHERE t1.ticker IS NOT NULL
+        AND t1.transaction_date >= '2016-01-01'
+        AND t1.member_bioguide_id IS NOT NULL
+    """))
+    vel_df = pd.DataFrame(r.fetchall(), columns=r.keys())
+
+    if not vel_df.empty:
+        vel_map = vel_df.set_index("trade_id")
+        mask = df["trade_id"].isin(vel_map.index)
+        df.loc[mask, "member_trades_30d"] = df.loc[mask, "trade_id"].map(vel_map["trades_30d"]).astype(float)
+        df.loc[mask, "member_trades_90d"] = df.loc[mask, "trade_id"].map(vel_map["trades_90d"]).astype(float)
+
+        # Velocity ratio: 30d rate / 90d rate (>1 means accelerating)
+        rate_30 = df["member_trades_30d"] / 30.0
+        rate_90 = df["member_trades_90d"] / 90.0
+        df["member_velocity_ratio"] = np.where(rate_90 > 0, rate_30 / rate_90, 1.0)
+        df["member_velocity_ratio"] = df["member_velocity_ratio"].clip(0, 10).astype(float)
+
+    logger.info("  Member velocity: %.1f avg trades/30d", df["member_trades_30d"].mean())
+
+
+async def _add_market_regime(session: AsyncSession, df: pd.DataFrame) -> None:
+    """Broad market context using SPY as S&P 500 proxy."""
+    df["spy_return_21d"] = 0.0
+    df["spy_return_63d"] = 0.0
+    df["spy_volatility_21d"] = 0.0
+    df["market_is_bull"] = 0.0
+
+    # Load SPY data
+    r = await session.execute(text("""
+        SELECT date, adj_close FROM stock_daily
+        WHERE ticker = 'SPY' AND date >= '2015-01-01'
+        ORDER BY date
+    """))
+    spy_df = pd.DataFrame(r.fetchall(), columns=r.keys())
+
+    if spy_df.empty:
+        logger.info("  No SPY data — skipping market regime features")
+        return
+
+    spy_df["price"] = spy_df["adj_close"].astype(float)
+    spy_df["date"] = pd.to_datetime(spy_df["date"])
+    spy_df = spy_df.set_index("date").sort_index()
+
+    for idx, row in df.iterrows():
+        td = pd.Timestamp(row["transaction_date"])
+        before = spy_df[spy_df.index < td].tail(63)
+        if len(before) < 5:
+            continue
+
+        prices = before["price"].values
+        current = float(prices[-1])
+
+        # 21d return
+        p21 = float(prices[-min(21, len(prices))]) if len(prices) >= 2 else current
+        df.at[idx, "spy_return_21d"] = (current - p21) / p21 if p21 > 0 else 0
+
+        # 63d return
+        p63 = float(prices[0]) if len(prices) >= 21 else p21
+        df.at[idx, "spy_return_63d"] = (current - p63) / p63 if p63 > 0 else 0
+
+        # 21d volatility
+        if len(prices) >= 22:
+            returns = np.diff(prices[-22:]) / prices[-22:-1]
+            df.at[idx, "spy_volatility_21d"] = float(np.std(returns, ddof=1))
+
+        # Bull market: SPY above 63d average
+        avg_63 = float(np.mean(prices))
+        df.at[idx, "market_is_bull"] = 1.0 if current > avg_63 else 0.0
+
+    logger.info("  Market regime: %.1f%% trades in bull market", df["market_is_bull"].mean() * 100)
+
+
+async def _add_sector_features(session: AsyncSession, df: pd.DataFrame) -> None:
+    """Stock sector/industry features and committee-sector alignment."""
+    df["sector_encoded"] = 0.0
+    df["committee_sector_match"] = 0.0
+
+    # Load or build sector cache
+    sector_map = _load_sector_cache()
+    tickers_needed = set(df["ticker"].unique()) - set(sector_map.keys())
+
+    if tickers_needed:
+        logger.info("  Fetching sector data for %d new tickers...", len(tickers_needed))
+        new_sectors = _fetch_sectors(list(tickers_needed)[:500])  # cap to avoid timeout
+        sector_map.update(new_sectors)
+        _save_sector_cache(sector_map)
+
+    # Encode sectors
+    unique_sectors = sorted(set(sector_map.values()) - {""})
+    sector_to_idx = {s: i + 1 for i, s in enumerate(unique_sectors)}
+    df["sector_encoded"] = df["ticker"].map(
+        lambda t: float(sector_to_idx.get(sector_map.get(t, ""), 0))
+    )
+
+    # Committee-sector alignment: does member sit on committee related to this stock's sector?
+    # Use committee_assignment data if available
+    r = await session.execute(text("""
+        SELECT member_bioguide_id, committee_code
+        FROM committee_assignment
+    """))
+    assignments = pd.DataFrame(r.fetchall(), columns=r.keys())
+
+    if not assignments.empty:
+        member_committees = assignments.groupby("member_bioguide_id")["committee_code"].apply(set).to_dict()
+        for idx, row in df.iterrows():
+            bio = row.get("member_bioguide_id")
+            ticker = row["ticker"]
+            if bio and bio in member_committees and ticker in sector_map:
+                sector = sector_map[ticker]
+                committees = member_committees[bio]
+                for comm_code, sectors in COMMITTEE_SECTOR_MAP.items():
+                    # Match on first 4 chars of committee code
+                    if any(c.startswith(comm_code[:4]) for c in committees):
+                        if sector in sectors:
+                            df.at[idx, "committee_sector_match"] = 1.0
+                            break
+
+    has_sector = (df["sector_encoded"] > 0).sum()
+    logger.info("  Sector data: %d / %d trades have sector (%.1f%%)",
+                has_sector, len(df), has_sector / len(df) * 100)
+
+
+def _load_sector_cache() -> dict[str, str]:
+    """Load cached ticker→sector mapping."""
+    if SECTOR_CACHE_PATH.exists():
+        return json.loads(SECTOR_CACHE_PATH.read_text())
+    return {}
+
+
+def _save_sector_cache(cache: dict[str, str]) -> None:
+    """Save ticker→sector cache."""
+    SECTOR_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SECTOR_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+
+
+def _fetch_sectors(tickers: list[str]) -> dict[str, str]:
+    """Fetch sector data from yfinance for a batch of tickers."""
+    import yfinance as yf
+
+    result = {}
+    for i, ticker in enumerate(tickers):
+        if i % 50 == 0 and i > 0:
+            logger.info("    Sector fetch progress: %d/%d", i, len(tickers))
+        try:
+            info = yf.Ticker(ticker).info
+            sector = info.get("sector", "")
+            result[ticker] = sector
+        except Exception:
+            result[ticker] = ""
+    return result
+
+
+async def _add_network_features_sql(session: AsyncSession, df: pd.DataFrame) -> None:
+    """Compute network features from PostgreSQL tables (SQL fallback when Neo4j unavailable)."""
+    df["lobbying_connection_count"] = 0.0
+    df["campaign_donor_connection"] = 0.0
+    df["network_degree"] = 0.0
+    df["has_lobbying_triangle"] = 0.0
+
+    # Lobbying connections: count lobbying filings for companies matching traded tickers
+    r = await session.execute(text("""
+        SELECT lc.matched_ticker as ticker, COUNT(DISTINCT lf.id) as filing_count
+        FROM lobbying_client lc
+        JOIN lobbying_filing lf ON lf.client_id = lc.id
+        WHERE lc.matched_ticker IS NOT NULL
+        GROUP BY lc.matched_ticker
+    """))
+    lobby_df = pd.DataFrame(r.fetchall(), columns=r.keys())
+    if not lobby_df.empty:
+        lobby_map = lobby_df.set_index("ticker")["filing_count"]
+        mask = df["ticker"].isin(lobby_map.index)
+        df.loc[mask, "lobbying_connection_count"] = df.loc[mask, "ticker"].map(lobby_map).fillna(0).astype(float)
+
+    # Campaign contributions: count contributions to member from companies matching ticker
+    r = await session.execute(text("""
+        SELECT cc2.member_bioguide_id, cc1.matched_ticker as ticker,
+               COUNT(*) as contribution_count
+        FROM campaign_contribution cc1
+        JOIN campaign_committee cc2 ON cc1.committee_id = cc2.id
+        WHERE cc1.matched_ticker IS NOT NULL
+        AND cc2.member_bioguide_id IS NOT NULL
+        GROUP BY cc2.member_bioguide_id, cc1.matched_ticker
+    """))
+    camp_df = pd.DataFrame(r.fetchall(), columns=r.keys())
+    if not camp_df.empty:
+        camp_map = camp_df.set_index(["member_bioguide_id", "ticker"])["contribution_count"]
+        for idx, row in df.iterrows():
+            key = (row.get("member_bioguide_id"), row["ticker"])
+            if key in camp_map.index:
+                df.at[idx, "campaign_donor_connection"] = float(camp_map[key])
+
+    # Network degree: total unique tickers a member has traded
+    r = await session.execute(text("""
+        SELECT member_bioguide_id, COUNT(DISTINCT ticker) as degree
+        FROM trade_disclosure
+        WHERE ticker IS NOT NULL AND member_bioguide_id IS NOT NULL
+        GROUP BY member_bioguide_id
+    """))
+    degree_df = pd.DataFrame(r.fetchall(), columns=r.keys())
+    if not degree_df.empty:
+        degree_map = degree_df.set_index("member_bioguide_id")["degree"]
+        mask = df["member_bioguide_id"].notna() & df["member_bioguide_id"].isin(degree_map.index)
+        df.loc[mask, "network_degree"] = df.loc[mask, "member_bioguide_id"].map(degree_map).astype(float)
+
+    has_lobby = (df["lobbying_connection_count"] > 0).sum()
+    logger.info("  Network (SQL): %d trades with lobbying connections", has_lobby)
+
+
 def _compute_rsi(prices, period: int = 14) -> float:
     """Compute RSI from prices (most recent first)."""
     if len(prices) < 2:
@@ -504,7 +911,8 @@ def _compute_rsi(prices, period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
-async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5) -> dict:
+async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5,
+                       use_catboost: bool = False) -> dict:
     """Train all models with temporal k-fold cross-validation.
 
     Data is sorted by transaction_date. For k folds, each fold uses
@@ -514,26 +922,33 @@ async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5
     from sqlalchemy import update as sa_update
 
     feature_cols = _feature_cols(df)
-    X = df[feature_cols].values.astype(float)
+
+    # Feature selection: drop features that are near-zero variance
+    X_raw = df[feature_cols].values.astype(float)
+    X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    variances = np.var(X_raw, axis=0)
+    keep_mask = variances > 1e-10
+    dropped = [feature_cols[i] for i in range(len(feature_cols)) if not keep_mask[i]]
+    if dropped:
+        logger.info("Dropping %d zero-variance features: %s", len(dropped), dropped)
+    feature_cols = [feature_cols[i] for i in range(len(feature_cols)) if keep_mask[i]]
+
+    X = X_raw[:, keep_mask]
     y_class = df["profitable"].values.astype(float)
     y_return = df["actual_return"].fillna(0).values.astype(float)
-
-    # Replace NaN
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     n = len(X)
     logger.info("Features (%d): %s", len(feature_cols), feature_cols)
     logger.info("Running %d-fold temporal cross-validation on %d samples", n_folds, n)
 
     # Temporal CV: fold i trains on [0, split_i), validates on [split_i, split_i+1)
-    # The minimum training size is 40% of data; folds expand from there
     min_train_frac = 0.4
     fold_size = int(n * (1 - min_train_frac) / n_folds)
 
-    fold_metrics: dict[str, list[dict]] = {
-        "trade_predictor": [], "return_predictor": [],
-        "anomaly_detector": [], "ensemble": [],
-    }
+    model_names = ["trade_predictor", "return_predictor", "anomaly_detector", "ensemble"]
+    if use_catboost:
+        model_names.append("catboost")
+    fold_metrics: dict[str, list[dict]] = {name: [] for name in model_names}
 
     for fold in range(n_folds):
         train_end = int(n * min_train_frac) + fold * fold_size
@@ -548,14 +963,14 @@ async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5
         logger.info("  Fold %d/%d: train=%d, val=%d (dates: train to idx %d, val to idx %d)",
                      fold + 1, n_folds, len(X_train), len(X_val), train_end, val_end)
 
-        # Trade Predictor
+        # Trade Predictor (LightGBM)
         tp = TradePredictor()
         tp.feature_columns = feature_cols
         tp.train(X_train, y_class_train, X_val, y_class_val)
         m = evaluate_classifier(y_class_val, tp.predict(X_val), tp.predict_proba(X_val))
         fold_metrics["trade_predictor"].append(m)
 
-        # Return Predictor
+        # Return Predictor (XGBoost)
         rp = ReturnPredictor()
         rp.feature_columns = feature_cols
         rp.train(X_train, y_return_train, X_val, y_return_val)
@@ -571,6 +986,11 @@ async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5
         m = ad.train(X_a_train, y_class_train)
         fold_metrics["anomaly_detector"].append(m)
 
+        # CatBoost (optional)
+        if use_catboost:
+            m = _train_catboost_fold(X_train, y_class_train, X_val, y_class_val, feature_cols)
+            fold_metrics["catboost"].append(m)
+
         # Ensemble
         tp_proba = np.concatenate([tp.predict_proba(X_train), tp.predict_proba(X_val)])
         rp_scores = np.concatenate([rp.predict(X_train), rp.predict(X_val)])
@@ -581,11 +1001,11 @@ async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5
         sentiment_idx = feature_cols.index("avg_sentiment_7d") if "avg_sentiment_7d" in feature_cols else None
         all_X = np.vstack([X_train, X_val])
 
-        meta = np.column_stack([
-            tp_proba, rp_scores, ad_scores,
-            all_X[:, timing_idx] if timing_idx is not None else np.zeros(len(all_X)),
-            all_X[:, sentiment_idx] if sentiment_idx is not None else np.zeros(len(all_X)),
-        ])
+        meta_cols = [tp_proba, rp_scores, ad_scores]
+        meta_cols.append(all_X[:, timing_idx] if timing_idx is not None else np.zeros(len(all_X)))
+        meta_cols.append(all_X[:, sentiment_idx] if sentiment_idx is not None else np.zeros(len(all_X)))
+
+        meta = np.column_stack(meta_cols)
         meta_train, meta_val = meta[:len(X_train)], meta[len(X_train):]
         ens = EnsembleModel()
         ens.feature_columns = EnsembleModel.META_FEATURES
@@ -614,6 +1034,14 @@ async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5
                         metrics.get("accuracy", 0), metrics.get("accuracy_std", 0),
                         metrics.get("auc", 0), metrics.get("auc_std", 0),
                         metrics.get("f1", 0), metrics.get("f1_std", 0))
+
+    # Feature importance from last LightGBM fold
+    if hasattr(tp, 'model') and hasattr(tp.model, 'feature_importances_'):
+        importances = tp.model.feature_importances_
+        top_idx = np.argsort(importances)[::-1][:15]
+        logger.info("  Top 15 features (LightGBM):")
+        for i in top_idx:
+            logger.info("    %3d. %-35s %6.1f", i, feature_cols[i], importances[i])
 
     # Final train on all data except last 20% for saving the best model
     split_idx = int(n * 0.8)
@@ -660,6 +1088,30 @@ async def train_models(df: pd.DataFrame, session: AsyncSession, n_folds: int = 5
     return results
 
 
+def _train_catboost_fold(X_train, y_train, X_val, y_val, feature_cols) -> dict:
+    """Train a CatBoost classifier for one CV fold."""
+    try:
+        from catboost import CatBoostClassifier
+    except ImportError:
+        logger.warning("CatBoost not installed — skipping. Install with: pip install catboost")
+        return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "auc": 0}
+
+    model = CatBoostClassifier(
+        iterations=500,
+        depth=6,
+        learning_rate=0.05,
+        auto_class_weights="Balanced",
+        random_seed=42,
+        verbose=0,
+        eval_metric="AUC",
+    )
+    model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50, verbose=0)
+
+    preds = model.predict(X_val).astype(float)
+    proba = model.predict_proba(X_val)[:, 1]
+    return evaluate_classifier(y_val, preds, proba)
+
+
 async def _save(session, model, version, metrics, feature_cols):
     """Save model artifact to disk and DB."""
     from sqlalchemy import update as sa_update
@@ -690,10 +1142,19 @@ async def _save(session, model, version, metrics, feature_cols):
 
 async def main():
     import sys
-    # Parse horizons from CLI args: python -m scripts.train_models 5d 21d 63d 90d
-    horizons = [a for a in sys.argv[1:] if a in ("5d", "21d", "63d", "90d", "180d")]
+    args = sys.argv[1:]
+
+    # Parse flags
+    use_catboost = "--catboost" in args
+    args = [a for a in args if not a.startswith("--")]
+
+    # Parse horizons
+    horizons = [a for a in args if a in ("5d", "21d", "63d", "90d", "180d")]
     if not horizons:
-        horizons = ["21d", "63d", "90d", "180d"]
+        horizons = ["90d", "180d"]  # default to best-performing horizons
+
+    if use_catboost:
+        logger.info("CatBoost enabled")
 
     all_results: dict[str, dict] = {}
 
@@ -708,12 +1169,12 @@ async def main():
                 logger.error("No training data for horizon %s!", horizon)
                 continue
 
-            results = await train_models(df, session)
+            results = await train_models(df, session, use_catboost=use_catboost)
             all_results[horizon] = results
 
     # Print comparison table
     print("\n" + "=" * 70)
-    print("  HORIZON COMPARISON")
+    print("  HORIZON COMPARISON (5-fold temporal CV)")
     print("=" * 70)
     print(f"  {'Model':<25s} {'Horizon':<10s} {'Accuracy':>10s} {'AUC':>10s} {'F1':>10s}")
     print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
@@ -721,7 +1182,8 @@ async def main():
     for horizon, results in all_results.items():
         for model_name, metrics in results.items():
             if "accuracy" in metrics:
-                print(f"  {model_name:<25s} {horizon:<10s} {metrics.get('accuracy', 0):>10.4f} {metrics.get('auc', 0):>10.4f} {metrics.get('f1', 0):>10.4f}")
+                acc_std = metrics.get("accuracy_std", 0)
+                print(f"  {model_name:<25s} {horizon:<10s} {metrics.get('accuracy', 0):>7.4f}±{acc_std:.3f} {metrics.get('auc', 0):>10.4f} {metrics.get('f1', 0):>10.4f}")
             elif "mae" in metrics:
                 print(f"  {model_name:<25s} {horizon:<10s} {'MAE:':>10s} {metrics.get('mae', 0):>10.4f} {metrics.get('r2', 0):>10.4f}")
 

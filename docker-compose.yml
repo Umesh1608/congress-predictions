@@ -30,7 +30,6 @@ services:
     environment:
       NEO4J_AUTH: neo4j/congress_neo4j
       NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_db_tx__timeout: 30s
     ports:
       - "7474:7474"
       - "7687:7687"
