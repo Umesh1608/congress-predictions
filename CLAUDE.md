@@ -146,11 +146,13 @@ congress_predictions/
 │   │       └── health.py           # Phase 8: /health/detailed, /health/legal
 │   │
 │   ├── ingestion/
-│   │   ├── base.py                 # RateLimiter, BaseCollector (abstract: collect/transform/run)
+│   │   ├── base.py                 # RateLimiter (asyncio.Lock for concurrency), BaseCollector (abstract: collect/transform/run)
 │   │   ├── loader.py               # All upsert functions (trades, stock, members, bills, lobbying, campaign finance, media)
 │   │   ├── trades/
-│   │   │   ├── house_watcher.py    # HouseWatcherCollector (free S3 JSON)
-│   │   │   ├── senate_watcher.py   # SenateWatcherCollector (free S3 JSON)
+│   │   │   ├── house_watcher.py    # HouseWatcherCollector (free S3 JSON — currently 403)
+│   │   │   ├── senate_watcher.py   # SenateWatcherCollector (free S3 JSON — currently 403)
+│   │   │   ├── house_clerk.py      # HouseClerkCollector (free, scrapes PTR PDFs from clerk.house.gov)
+│   │   │   ├── github_senate.py    # GitHubSenateCollector (free, CSV from jeremiak GitHub dataset)
 │   │   │   └── fmp_client.py       # FMPHouseCollector, FMPSenateCollector (paid API)
 │   │   ├── market/
 │   │   │   └── yahoo_finance.py    # fetch_stock_history() via yfinance
@@ -170,8 +172,8 @@ congress_predictions/
 │   │       └── twitter.py          # TwitterCollector (stub, skip-if-no-key)
 │   │
 │   ├── tasks/
-│   │   ├── celery_app.py           # Celery app, beat schedule config (26 scheduled tasks)
-│   │   ├── ingestion_tasks.py      # Trade + market data tasks
+│   │   ├── celery_app.py           # Celery app, beat schedule config (27 scheduled tasks), explicit conf.include
+│   │   ├── ingestion_tasks.py      # Trade + market data tasks (with S3→fallback logic)
 │   │   ├── legislation_tasks.py    # Legislative data tasks
 │   │   ├── network_tasks.py        # Lobbying, campaign finance, entity resolution, graph sync tasks
 │   │   ├── media_tasks.py          # Media collection + NLP analysis tasks
@@ -214,6 +216,9 @@ congress_predictions/
 │   │   │   ├── test_senate_watcher.py  # 3 tests
 │   │   │   ├── test_congress_gov.py    # 14 tests
 │   │   │   └── test_voteview.py        # 5 tests
+│   │   ├── test_trades/
+│   │   │   ├── test_house_clerk.py     # 16 tests (HTML parsing, PDF text parsing, transform, concurrency)
+│   │   │   └── test_github_senate.py   # 11 tests (transform, fallback, edge cases)
 │   │   ├── test_processing/
 │   │   │   └── test_timing_analysis.py # 8 tests
 │   │   ├── test_network/
@@ -299,7 +304,7 @@ congress_predictions/
 | amount_range_low | Numeric(15,2) | nullable |
 | amount_range_high | Numeric(15,2) | nullable |
 | chamber | String(10) | "house" / "senate" |
-| source | String(50) | "house_watcher" / "senate_watcher" / "fmp_house" / "fmp_senate" |
+| source | String(50) | "house_watcher" / "senate_watcher" / "house_clerk" / "github_senate" / "fmp_house" / "fmp_senate" |
 | filing_url | Text | nullable |
 | raw_data | JSONB | original source record |
 | created_at | DateTime(tz) | server default: now() |
@@ -624,17 +629,21 @@ All collectors extend `BaseCollector` (in `src/ingestion/base.py`):
 - `collect()` → fetches raw records from source
 - `transform(raw)` → converts to dict for DB upsert (returns None to skip)
 - `run()` → orchestrates collect → transform pipeline
-- Built-in: rate limiting (`RateLimiter`), retry with backoff, HTTP 429 handling
+- Built-in: rate limiting (`RateLimiter` with `asyncio.Lock` for concurrent safety), retry with backoff, HTTP 429 handling
 
 ### Data Sources (Phase 1)
 
-| Source | Class | URL / API | Cost | Schedule |
-|---|---|---|---|---|
-| House Stock Watcher | `HouseWatcherCollector` | S3 JSON: `house-stock-watcher-data.s3-us-west-2.amazonaws.com` | Free | Every 6h |
-| Senate Stock Watcher | `SenateWatcherCollector` | S3 JSON: `senate-stock-watcher-data.s3-us-west-2.amazonaws.com` | Free | Every 6h |
-| FMP House | `FMPHouseCollector` | `financialmodelingprep.com/stable/house-disclosure` | $15-30/mo | Every 6h |
-| FMP Senate | `FMPSenateCollector` | `financialmodelingprep.com/stable/senate-trading` | $15-30/mo | Every 6h |
-| Yahoo Finance | `fetch_stock_history()` | yfinance library | Free | Daily 4:30 PM ET |
+| Source | Class | URL / API | Cost | Schedule | Status |
+|---|---|---|---|---|---|
+| House Stock Watcher | `HouseWatcherCollector` | S3 JSON: `house-stock-watcher-data.s3-us-west-2.amazonaws.com` | Free | Every 6h | **403 — down since ~2025** |
+| Senate Stock Watcher | `SenateWatcherCollector` | S3 JSON: `senate-stock-watcher-data.s3-us-west-2.amazonaws.com` | Free | Every 6h | **403 — down since ~2025** |
+| House Clerk (fallback) | `HouseClerkCollector` | Scrapes PTR PDFs from `disclosures-clerk.house.gov` | Free | Every 6h at :10 | **Active** |
+| GitHub Senate CSV (fallback) | `GitHubSenateCollector` | `github.com/jeremiak/us-senate-financial-disclosure-data` | Free | Fallback for Senate | **Active** (2012-2024 data) |
+| FMP House | `FMPHouseCollector` | `financialmodelingprep.com/stable/house-disclosure` | $15-30/mo | Every 6h | Supplement (needs API key) |
+| FMP Senate | `FMPSenateCollector` | `financialmodelingprep.com/stable/senate-trading` | $15-30/mo | Every 6h | Supplement (needs API key) |
+| Yahoo Finance | `fetch_stock_history()` | yfinance library | Free | Daily 4:30 PM ET | **Active** |
+
+**Fallback strategy:** Celery tasks `collect_house_trades` and `collect_senate_trades` try the S3 watchers first. On failure (403), they automatically fall back to `HouseClerkCollector` and `GitHubSenateCollector` respectively. The House Clerk task also runs independently every 6h at :10 for direct scraping.
 
 ### Data Sources (Phase 2)
 
@@ -699,13 +708,14 @@ House/Senate watchers report ranges like `"$15,001 - $50,000"`. These are parsed
 **Timezone:** US/Eastern
 **Concurrency:** 4 workers
 
-| Beat Name | Task | Schedule |
-|---|---|---|
-| `collect-house-trades-every-6h` | `collect_house_trades` | Every 6h at :00 |
-| `collect-senate-trades-every-6h` | `collect_senate_trades` | Every 6h at :15 |
-| `collect-fmp-house-every-6h` | `collect_fmp_house_trades` | Every 6h at :30 |
-| `collect-fmp-senate-every-6h` | `collect_fmp_senate_trades` | Every 6h at :45 |
-| `collect-market-data-daily` | `collect_market_data` | Daily at 4:30 PM ET |
+| Beat Name | Task | Schedule | Notes |
+|---|---|---|---|
+| `collect-house-trades-every-6h` | `collect_house_trades` | Every 6h at :00 | S3 → House Clerk fallback |
+| `collect-house-clerk-trades-every-6h` | `collect_house_clerk_trades` | Every 6h at :10 | Direct clerk.house.gov scrape |
+| `collect-senate-trades-every-6h` | `collect_senate_trades` | Every 6h at :15 | S3 → GitHub CSV fallback |
+| `collect-fmp-house-every-6h` | `collect_fmp_house_trades` | Every 6h at :30 | Needs FMP_API_KEY |
+| `collect-fmp-senate-every-6h` | `collect_fmp_senate_trades` | Every 6h at :45 | Needs FMP_API_KEY |
+| `collect-market-data-daily` | `collect_market_data` | Daily at 4:30 PM ET | |
 | `collect-members-daily` | `collect_members` | Daily at 6:00 AM ET |
 | `collect-bills-daily` | `collect_bills` | Daily at 6:15 AM ET |
 | `collect-committees-weekly` | `collect_committees` | Sunday 5:00 AM ET |
@@ -728,7 +738,7 @@ House/Senate watchers report ranges like `"$15,001 - $50,000"`. These are parsed
 | `expire-signals-daily` | `expire_signals` | Daily 3:00 AM ET |
 | `backfill-actual-returns-daily` | `backfill_actual_returns` | Daily 5:00 PM ET |
 
-Tasks use `asyncio.run()` to bridge Celery's sync workers with async collectors/DB operations. Each task creates its own engine/session factory (not shared with the FastAPI app). Twitter task (`collect_tweets`) is defined but NOT in the beat schedule — activate by adding to beat_schedule when API key is available.
+Tasks use `asyncio.run()` to bridge Celery's sync workers with async collectors/DB operations. Each task creates its own engine/session factory (not shared with the FastAPI app). Task discovery uses explicit `conf.include` (not `autodiscover_tasks`, which doesn't work with non-standard module names like `ingestion_tasks.py`). Twitter task (`collect_tweets`) is defined but NOT in the beat schedule — activate by adding to beat_schedule when API key is available.
 
 ---
 
@@ -778,7 +788,7 @@ All app services mount `.` as a volume for hot-reload during development. Docker
 **Framework:** pytest + pytest-asyncio
 **Run:** `python -m pytest tests/ -v`
 
-### Current Tests (250 passing)
+### Current Tests (277 passing)
 
 **tests/conftest.py** — Shared fixtures:
 - `sample_house_trade_raw` — Nancy Pelosi NVDA purchase record
@@ -794,6 +804,17 @@ All app services mount `.` as a volume for hot-reload during development. Docker
 - `TestCurrentCongress` (1) — congress number sanity check
 
 **tests/unit/test_ingestion/test_voteview.py** — 5 tests (basic record, party mapping, independent, missing bioguide, NaN scores)
+
+**tests/unit/test_trades/test_house_clerk.py** — 16 tests:
+- `TestSearchResultParser` (2) — basic table parsing, empty table
+- `TestParsePtrPdfText` (3) — basic trade extraction, purchase trade, no trades
+- `TestHouseClerkTransform` (7) — purchase/sale transform, exchange type, no date/name returns None, default/custom years
+- `TestConcurrentCollect` (3) — concurrent faster than sequential, malformed PDF doesn't crash, semaphore limits concurrency
+- `TestRateLimiterConcurrency` (1) — concurrent acquires respect rate limit
+
+**tests/unit/test_trades/test_github_senate.py** — 11 tests:
+- Basic transform, sale types, partial sale, no ticker, long ticker nullified, no date, no filer, dependent/joint owner, date formats, raw data preserved
+
 **tests/unit/test_processing/test_timing_analysis.py** — 8 tests (suspicion score: zero baseline, hearing proximity 3d/7d, sector alignment, late disclosure, sponsored bill, cap at 1.0, bill proximity 30d)
 **tests/unit/test_network/test_normalizer.py** — 12 tests:
 - `TestNormalizeCompanyName` (6) — suffix stripping, empty/None handling, whitespace, punctuation
@@ -844,6 +865,9 @@ All app services mount `.` as a volume for hot-reload during development. Docker
 ---
 
 ## Key Design Decisions
+
+### Multi-Source Fallback Cascade
+Trade collection uses a fallback strategy: primary S3 sources (House/Senate Stock Watcher) are tried first, and on failure (currently 403), tasks automatically fall back to free alternatives — `HouseClerkCollector` (scrapes PTR PDFs from clerk.house.gov with concurrent downloads via `asyncio.Semaphore(10)`) and `GitHubSenateCollector` (parses CSV from jeremiak's GitHub dataset). FMP paid API runs as a supplementary source on a separate schedule. All sources deduplicate via the same unique index, so duplicate trades from multiple sources are handled automatically.
 
 ### Dual Dating for the 30-45 Day Reporting Lag
 Every trade stores both `transaction_date` (when it happened) and `disclosure_date` (when it was filed). This is critical because:
@@ -997,17 +1021,19 @@ Middleware is applied in order: CorrelationId → RateLimit → ApiKey → CORS.
 - [x] Response cache (`src/api/cache.py`): in-memory TTL cache with @cached decorator, prefix invalidation
 - [x] Enhanced health checks: /health/detailed (PostgreSQL, Redis, Neo4j, data freshness), /health/legal (disclaimer)
 - [x] Config: rate_limit_per_minute, rate_limit_authenticated, api_keys settings
-- [x] Unit tests: 24 new — 250 total passing
+- [x] Unit tests: 24 new — 250 total passing (277 after trade source additions)
 
 ---
 
 ## Data Sources & Costs
 
-| Source | Data | Cost | Phase |
-|---|---|---|---|
-| House/Senate Stock Watcher | Trade filings | Free | 1 (done) |
-| yfinance | Stock prices | Free | 1 (done) |
-| Financial Modeling Prep | Structured trade API | ~$15-30/mo | 1 (done) |
+| Source | Data | Cost | Phase | Status |
+|---|---|---|---|---|
+| House/Senate Stock Watcher | Trade filings | Free | 1 | **S3 returning 403** — fallbacks active |
+| House Clerk PTR Scraper | House trade PDFs | Free | 1 | **Active** — scrapes disclosures-clerk.house.gov |
+| GitHub Senate CSV | Senate trades (2012-2024) | Free | 1 | **Active** — jeremiak/us-senate-financial-disclosure-data |
+| yfinance | Stock prices | Free | 1 | Active |
+| Financial Modeling Prep | Structured trade API | ~$15-30/mo | 1 | Supplement (needs API key) |
 | Congress.gov API | Bills, members, committees, votes, hearings | Free | 2 (done) |
 | Voteview CSV | DW-NOMINATE ideology scores | Free | 2 (done) |
 | Senate LDA API | Lobbying filings (registrants, clients, lobbyists, issues) | Free | 3 (done) |
@@ -1020,7 +1046,7 @@ Middleware is applied in order: CorrelationId → RateLimit → ApiKey → CORS.
 | Member press releases | RSS from member websites | Free | 4 (done) |
 | X/Twitter API | Social media posts | ~$200/mo | 4 (stub, skip-if-no-key) |
 
-**Current cost: ~$15-30/mo** (FMP only). All Phase 4 media sources are free. X/Twitter: ~$200/mo when activated.
+**Current cost: $0/mo** with free fallback sources. FMP optional at ~$15-30/mo for structured API supplement. All Phase 4 media sources are free. X/Twitter: ~$200/mo when activated.
 
 ---
 
