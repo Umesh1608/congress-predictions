@@ -46,6 +46,12 @@ def collect_senate_trades():
     asyncio.run(_run_collector(SenateWatcherCollector))
 
 
+@celery_app.task(name="src.tasks.ingestion_tasks.collect_house_clerk_trades")
+def collect_house_clerk_trades():
+    from src.ingestion.trades.house_clerk import HouseClerkCollector
+    asyncio.run(_run_collector(HouseClerkCollector))
+
+
 @celery_app.task(name="src.tasks.ingestion_tasks.collect_fmp_house_trades")
 def collect_fmp_house_trades():
     from src.ingestion.trades.fmp_client import FMPHouseCollector

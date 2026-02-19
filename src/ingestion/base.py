@@ -20,15 +20,17 @@ class RateLimiter:
         self.max_calls = max_calls
         self.period = period_seconds
         self.calls: list[float] = []
+        self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        now = time.monotonic()
-        self.calls = [t for t in self.calls if now - t < self.period]
-        if len(self.calls) >= self.max_calls:
-            sleep_time = self.period - (now - self.calls[0])
-            logger.debug("Rate limit hit, sleeping %.1fs", sleep_time)
-            await asyncio.sleep(sleep_time)
-        self.calls.append(time.monotonic())
+        async with self._lock:
+            now = time.monotonic()
+            self.calls = [t for t in self.calls if now - t < self.period]
+            if len(self.calls) >= self.max_calls:
+                sleep_time = self.period - (now - self.calls[0])
+                logger.debug("Rate limit hit, sleeping %.1fs", sleep_time)
+                await asyncio.sleep(sleep_time)
+            self.calls.append(time.monotonic())
 
 
 class BaseCollector(ABC):

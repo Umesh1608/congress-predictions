@@ -29,6 +29,10 @@ celery_app.conf.beat_schedule = {
         "task": "src.tasks.ingestion_tasks.collect_senate_trades",
         "schedule": crontab(minute=15, hour="*/6"),
     },
+    "collect-house-clerk-trades-every-6h": {
+        "task": "src.tasks.ingestion_tasks.collect_house_clerk_trades",
+        "schedule": crontab(minute=10, hour="*/6"),
+    },
     "collect-fmp-house-every-6h": {
         "task": "src.tasks.ingestion_tasks.collect_fmp_house_trades",
         "schedule": crontab(minute=30, hour="*/6"),

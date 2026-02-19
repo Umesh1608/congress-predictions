@@ -8,6 +8,7 @@ This is a free fallback when the House Stock Watcher S3 endpoint is down.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import date, datetime
@@ -26,8 +27,11 @@ HOUSE_CLERK_SEARCH_URL = (
 )
 HOUSE_CLERK_BASE_URL = "https://disclosures-clerk.house.gov/"
 
-# Rate limit to be respectful to government servers
-_house_clerk_rate_limiter = RateLimiter(max_calls=2, period_seconds=1.0)
+# Rate limit: 5 req/sec is safe for government servers (they handle 100+)
+_house_clerk_rate_limiter = RateLimiter(max_calls=5, period_seconds=1.0)
+
+# Max concurrent PDF downloads (bounded by semaphore)
+_MAX_CONCURRENT_DOWNLOADS = 10
 
 
 class _SearchResultParser(HTMLParser):
@@ -81,14 +85,6 @@ def _parse_ptr_pdf_text(text: str, member_name: str, pdf_url: str) -> list[dict[
     # Extract state/district
     state_match = re.search(r"State/District:\s*([A-Z]{2}\d{0,2})", text)
     state = state_match.group(1) if state_match else ""
-
-    # Pattern for transaction lines in PTR PDFs
-    # Format: asset description (TICKER) [TYPE]\n TX_TYPE DATE DATE AMOUNT
-    # The text extraction concatenates these, so we need a flexible regex
-    #
-    # Common patterns after pypdf extraction:
-    # "Apple Inc. (AAPL) [ST]\nP 01/15/202502/01/2025$1,001 - $15,000"
-    # "GSK plc American Depositary Shares\n(GSK) [ST]\nS 07/28/202508/11/2025$1,001 - $15,000"
 
     # Split into lines for processing
     lines = text.split("\n")
@@ -154,8 +150,6 @@ def _parse_ptr_pdf_text(text: str, member_name: str, pdf_url: str) -> list[dict[
 
             # Extract owner from earlier in the text block
             owner = "Self"
-            # Check if "SP" (spouse) or "DC" (dependent child) or "JT" (joint)
-            # appears before the asset name in nearby context
             owner_check = " ".join(lines[max(0, i - 3) : i + 1])
             if re.search(r"\bSP\b", owner_check):
                 owner = "Spouse"
@@ -193,42 +187,54 @@ class HouseClerkCollector(BaseCollector):
         super().__init__()
         if years is None:
             # Default to current year only to keep initial seed fast
-            # (~1500 PTR PDFs per year, ~2 req/sec = ~12min per year)
             self.years = [date.today().year]
         else:
             self.years = years
 
     async def collect(self) -> list[dict[str, Any]]:
-        """Search for all PTR filings and download/parse each PDF."""
+        """Search for all PTR filings and download/parse PDFs concurrently."""
         all_trades: list[dict[str, Any]] = []
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
 
         for year in self.years:
             logger.info("[%s] Fetching PTR filings for %d", self.source_name, year)
             filings = await self._search_filings(year)
             ptr_filings = [f for f in filings if "PTR" in f.get("filing_type", "")]
             logger.info(
-                "[%s] Found %d PTR filings for %d", self.source_name, len(ptr_filings), year
+                "[%s] Found %d PTR filings for %d",
+                self.source_name, len(ptr_filings), year,
             )
 
-            for filing in ptr_filings:
+            async def _process_filing(
+                filing: dict[str, str], _sem: asyncio.Semaphore = semaphore
+            ) -> list[dict[str, Any]]:
                 pdf_url = filing.get("pdf_url", "")
                 if not pdf_url:
-                    continue
+                    return []
+                async with _sem:
+                    try:
+                        if self.rate_limiter:
+                            await self.rate_limiter.acquire()
+                        return await self._download_and_parse_ptr(
+                            pdf_url, filing.get("name", ""),
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "[%s] Failed to parse PDF %s: %s",
+                            self.source_name, pdf_url, e,
+                        )
+                        return []
 
-                try:
-                    if self.rate_limiter:
-                        await self.rate_limiter.acquire()
+            results = await asyncio.gather(
+                *[_process_filing(f) for f in ptr_filings]
+            )
+            for trades in results:
+                all_trades.extend(trades)
 
-                    trades = await self._download_and_parse_ptr(
-                        pdf_url, filing.get("name", "")
-                    )
-                    all_trades.extend(trades)
-                except Exception as e:
-                    logger.debug(
-                        "[%s] Failed to parse PDF %s: %s", self.source_name, pdf_url, e
-                    )
-
-        logger.info("[%s] Extracted %d total trades from PDFs", self.source_name, len(all_trades))
+        logger.info(
+            "[%s] Extracted %d total trades from PDFs",
+            self.source_name, len(all_trades),
+        )
         return all_trades
 
     async def _search_filings(self, year: int) -> list[dict[str, str]]:
@@ -281,16 +287,24 @@ class HouseClerkCollector(BaseCollector):
             return []
 
         response = await self.client.get(pdf_url)
+
+        # Handle 404s gracefully (some filing PDFs are removed)
+        if response.status_code == 404:
+            return []
         response.raise_for_status()
 
         # Verify it's actually a PDF
         if not response.content.startswith(b"%PDF"):
             return []
 
-        reader = PdfReader(BytesIO(response.content))
-        full_text = ""
-        for page in reader.pages:
-            full_text += page.extract_text() + "\n"
+        try:
+            reader = PdfReader(BytesIO(response.content))
+            full_text = ""
+            for page in reader.pages:
+                full_text += page.extract_text() + "\n"
+        except Exception as e:
+            logger.debug("[%s] PDF parsing error for %s: %s", self.source_name, pdf_url, e)
+            return []
 
         return _parse_ptr_pdf_text(full_text, member_name, pdf_url)
 
