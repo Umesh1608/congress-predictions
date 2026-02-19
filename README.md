@@ -10,7 +10,7 @@ Track trades by Congress and Senate members (and their families, staff, and asso
 
 Members of Congress are required to disclose stock trades within 30-45 days. This system:
 
-1. **Ingests** trade disclosures from 4 sources, market data, legislative activity, lobbying filings, campaign finance, and media content from 7 sources
+1. **Ingests** trade disclosures from 6 sources (with automatic fallback cascade), market data, legislative activity, lobbying filings, campaign finance, and media content from 7 sources
 2. **Builds** a relationship graph (Neo4j) connecting members to companies via lobbying, campaign donations, committee assignments, and revolving-door lobbyists
 3. **Analyzes** trade-legislation timing correlations, media sentiment (FinBERT), and network connections
 4. **Predicts** trade profitability using an ensemble of LightGBM, XGBoost, and Isolation Forest models
@@ -22,7 +22,7 @@ Members of Congress are required to disclose stock trades within 30-45 days. Thi
 ## Architecture
 
 ```
-Data Sources (17)        Celery Workers (26 tasks)       Storage
+Data Sources (17+)       Celery Workers (28 tasks)       Storage
  ├─ Trade Filings  ───>  ├─ Ingestion Tasks  ──────────> PostgreSQL 16
  ├─ Market Data    ───>  ├─ Legislative Tasks             (SQLAlchemy async)
  ├─ Congress.gov   ───>  ├─ Network Tasks    ──────────> Neo4j 5
@@ -116,11 +116,13 @@ streamlit run dashboard/app.py
 
 ## Data Sources
 
-| Source | Data | Cost | API Key |
-|---|---|---|---|
-| House/Senate Stock Watcher | Trade filings (S3 JSON) | Free | None |
-| Financial Modeling Prep | Structured trade API | ~$15-30/mo | [fmp](https://financialmodelingprep.com/) |
-| Yahoo Finance | Stock prices (yfinance) | Free | None |
+| Source | Data | Cost | API Key | Status |
+|---|---|---|---|---|
+| House Clerk PTR Scraper | House trade PDFs from clerk.house.gov | Free | None | **Primary** |
+| GitHub Senate CSV | Senate trades 2012-2024 | Free | None | **Primary** |
+| House/Senate Stock Watcher | Trade filings (S3 JSON) | Free | None | **Down (403)** — fallbacks above |
+| Financial Modeling Prep | Structured trade API | ~$15-30/mo | [fmp](https://financialmodelingprep.com/) | Supplement |
+| Yahoo Finance | Stock prices (yfinance) | Free | None | Active |
 | Congress.gov | Members, bills, committees, hearings | Free | [api.data.gov](https://api.data.gov/signup/) |
 | Voteview | DW-NOMINATE ideology scores | Free | None |
 | Senate LDA | Lobbying filings | Free | None |
@@ -137,9 +139,13 @@ streamlit run dashboard/app.py
 
 All collectors use a skip-if-no-key pattern — missing API keys are silently skipped, not errors.
 
+**Fallback strategy:** The original House/Senate Stock Watcher S3 endpoints are returning 403 (down since ~2025). The system automatically falls back to free alternatives:
+- **House trades** → `HouseClerkCollector` scrapes PTR PDFs from `disclosures-clerk.house.gov` with concurrent downloads (semaphore-bounded, 10 concurrent)
+- **Senate trades** → `GitHubSenateCollector` parses CSV data from [jeremiak/us-senate-financial-disclosure-data](https://github.com/jeremiak/us-senate-financial-disclosure-data)
+
 > **Optional paid upgrades:** The system is pre-built to support two paid data sources that can be activated at any time by adding their API keys to `.env`:
 > - **X/Twitter API (~$200/mo)** — Real-time social media sentiment from congressional accounts. The collector, transform logic, and Celery task are fully implemented; just set `TWITTER_BEARER_TOKEN` and add the task to the beat schedule.
-> - **Financial Modeling Prep (~$15-30/mo)** — Structured, cleaned trade disclosure data as a complement to the free House/Senate Stock Watcher sources. Set `FMP_API_KEY` to activate. Already included in the default beat schedule.
+> - **Financial Modeling Prep (~$15-30/mo)** — Structured, cleaned trade disclosure data as a complement to the free sources. Set `FMP_API_KEY` to activate. Already included in the default beat schedule.
 
 ---
 
@@ -210,17 +216,19 @@ Base URL: `/api/v1` | Full docs at `/docs` (Swagger UI)
 
 ---
 
-## Background Tasks (26 scheduled)
+## Background Tasks (27 scheduled)
 
 All tasks run via Celery Beat on US/Eastern timezone:
 
 | Frequency | Tasks |
 |---|---|
 | **Every 3h** | Congress RSS feeds |
-| **Every 6h** | Trade collection (4 sources), news articles (GNews + NewsData) |
+| **Every 6h** | Trade collection (5 sources incl. House Clerk direct scrape), news articles (GNews + NewsData) |
 | **Every 30min** | Alert dispatch |
 | **Daily** | Members, bills, market data, YouTube, press releases, NLP analysis, batch predictions, signal generation, return backfill, signal expiration |
 | **Weekly (Sunday)** | Committees, hearings, Voteview scores, lobbying filings, campaign finance, entity resolution, graph sync, ML model retraining |
+
+Trade collection is **incremental** — each run queries existing filing URLs from the database and only downloads new PDFs not yet processed. This keeps the 6-hour schedule fast (seconds for no-new-data runs vs. hours for a full scrape).
 
 ---
 
@@ -238,7 +246,7 @@ All tasks run via Celery Beat on US/Eastern timezone:
 ## Development
 
 ```bash
-# Run all tests (250 passing)
+# Run all tests (277 passing)
 python -m pytest tests/ -v
 
 # Run specific test suites
@@ -275,7 +283,8 @@ alembic upgrade head
 ## Key Design Decisions
 
 - **Dual dating** — Every trade stores `transaction_date` (when it happened) and `disclosure_date` (when filed). The 30-45 day lag is itself a signal.
-- **Multi-source dedup** — Trades from different sources are deduplicated via unique index on `(member_name, ticker, transaction_date, transaction_type, amount_range_low)`.
+- **Multi-source fallback cascade** — S3 watchers tried first; on 403, automatically falls back to House Clerk scraper (free PDF parsing) and GitHub Senate CSV. FMP runs as supplementary source. All deduplicated via unique index on `(member_name, ticker, transaction_date, transaction_type, amount_range_low)`.
+- **Incremental collection** — Celery tasks query existing filing URLs before collecting, so scheduled runs only download new filings. Backfill script (`scripts/backfill_house_clerk.py`) handles historical data with streaming DB inserts.
 - **Walk-forward CV** — ML models use temporal cross-validation split on `transaction_date` to prevent future data leakage. The anomaly model additionally excludes market features.
 - **Stacking ensemble** — Meta-learner combines probability outputs from 3 base models + direct features (timing suspicion score, sentiment) to learn optimal signal weighting.
 - **Composite signal scoring** — Multi-factor scoring with freshness bonus, lag penalty, corroboration bonus, and cluster size bonus. All scores capped at 1.0.
@@ -288,7 +297,7 @@ alembic upgrade head
 
 | Capability | Capitol Trades / Quiver / Unusual Whales | This System |
 |---|---|---|
-| Trade filing aggregation | Yes | Yes (4 sources, multi-source dedup) |
+| Trade filing aggregation | Yes | Yes (6 sources with fallback cascade, multi-source dedup) |
 | Network/relationship graph | No | Neo4j graph: members, lobbyists, donors, staff, companies |
 | Predictive ML models | No | LightGBM + XGBoost + Isolation Forest + ensemble |
 | NLP sentiment analysis | No | FinBERT on news, press releases, hearing transcripts |

@@ -25,6 +25,11 @@ docker compose up -d postgres redis neo4j
 python -m scripts.seed_initial_data              # Full backfill (trades + market data)
 python -m scripts.seed_initial_data --skip-market-data  # Trades only (faster)
 
+# 5b. Backfill House Clerk data (multi-year, runs in background)
+nohup python3 -m scripts.backfill_house_clerk --start 2020 > backfill.log 2>&1 &
+# Or specific years:
+python -m scripts.backfill_house_clerk --years 2023 2024
+
 # 6. Start the API
 uvicorn src.main:app --reload
 # API docs at http://localhost:8000/docs
@@ -206,7 +211,8 @@ congress_predictions/
 │       └── alerting.py             # Alert dispatch + rate limiting (10/hour/config) + webhook
 │
 ├── scripts/
-│   └── seed_initial_data.py        # Historical backfill: creates tables, loads trades + market data
+│   ├── seed_initial_data.py        # Historical backfill: creates tables, loads trades + market data
+│   └── backfill_house_clerk.py     # Multi-year House Clerk backfill (streaming inserts, 10 req/sec)
 │
 ├── tests/
 │   ├── conftest.py                 # Fixtures: sample_house_trade_raw, sample_senate_trade_raw
@@ -685,6 +691,7 @@ All media collectors use skip-if-no-key pattern. GovInfo/GNews/NewsData keys: fr
 - `upsert_trades()` — PostgreSQL `INSERT ON CONFLICT DO NOTHING` using the dedup index
 - `upsert_stock_daily()` — same pattern on (ticker, date) composite key
 - `get_unique_tickers()` — distinct tickers from trade_disclosure for market data backfill
+- `get_existing_filing_urls(session, source)` — returns set of already-processed filing URLs for incremental collection
 - `upsert_members()` — `ON CONFLICT DO UPDATE` on bioguide_id (merges new fields)
 - `update_member_ideology()` — updates only nominate_dim1/dim2 on existing members
 - `upsert_bills()` — `ON CONFLICT DO UPDATE` on bill_id (updates status, actions, subjects)
