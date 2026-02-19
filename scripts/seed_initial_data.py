@@ -6,9 +6,16 @@ Usage:
 
 This script:
 1. Creates all database tables
-2. Fetches historical trades from House and Senate Stock Watchers
+2. Fetches historical trades from multiple sources (with fallbacks)
 3. Optionally fetches FMP data if API key is configured
 4. Backfills market data for all traded tickers
+
+Trade data sources (tried in order):
+- House Stock Watcher (S3 JSON) — free, may be down
+- Senate Stock Watcher (S3 JSON) — free, may be down
+- GitHub Senate CSV (jeremiak dataset) — free fallback, 2012-2024
+- House Clerk PTR scraper — free fallback, scrapes clerk.house.gov
+- FMP House/Senate — paid, requires API key
 """
 
 from __future__ import annotations
@@ -25,6 +32,8 @@ from src.config import settings
 from src.db.postgres import Base
 from src.ingestion.trades.house_watcher import HouseWatcherCollector
 from src.ingestion.trades.senate_watcher import SenateWatcherCollector
+from src.ingestion.trades.github_senate import GitHubSenateCollector
+from src.ingestion.trades.house_clerk import HouseClerkCollector
 from src.ingestion.trades.fmp_client import FMPHouseCollector, FMPSenateCollector
 from src.ingestion.loader import upsert_trades, upsert_stock_daily, get_unique_tickers
 from src.ingestion.market.yahoo_finance import fetch_stock_history
@@ -43,9 +52,9 @@ async def create_tables(engine):
     logger.info("Database tables created/verified")
 
 
-async def collect_and_load(factory, collector_cls):
+async def collect_and_load(factory, collector_cls, **kwargs):
     """Run a collector and load results into the database."""
-    collector = collector_cls()
+    collector = collector_cls(**kwargs) if kwargs else collector_cls()
     try:
         records = await collector.run()
         if records:
@@ -93,13 +102,34 @@ async def main(skip_market_data: bool = False):
         # Step 1: Create tables
         await create_tables(engine)
 
-        # Step 2: Collect trades from all sources
+        # Step 2: Collect trades from primary sources
         total = 0
-        for cls in [HouseWatcherCollector, SenateWatcherCollector]:
-            count = await collect_and_load(factory, cls)
-            total += count
+        senate_count = 0
+        house_count = 0
 
-        # Step 3: Try FMP if configured
+        # Try primary sources first (S3 JSON endpoints)
+        logger.info("Trying primary sources (Stock Watcher S3)...")
+        house_count = await collect_and_load(factory, HouseWatcherCollector)
+        total += house_count
+        senate_count = await collect_and_load(factory, SenateWatcherCollector)
+        total += senate_count
+
+        # Step 3: Fallback to alternative free sources if primary failed
+        if senate_count == 0:
+            logger.info("Senate Stock Watcher unavailable, trying GitHub CSV fallback...")
+            count = await collect_and_load(factory, GitHubSenateCollector)
+            total += count
+            if count > 0:
+                logger.info("GitHub Senate CSV fallback loaded %d trades", count)
+
+        if house_count == 0:
+            logger.info("House Stock Watcher unavailable, trying House Clerk scraper...")
+            count = await collect_and_load(factory, HouseClerkCollector)
+            total += count
+            if count > 0:
+                logger.info("House Clerk scraper loaded %d trades", count)
+
+        # Step 4: Try FMP if configured (supplements other sources)
         if settings.fmp_api_key:
             for cls in [FMPHouseCollector, FMPSenateCollector]:
                 count = await collect_and_load(factory, cls)
@@ -109,7 +139,7 @@ async def main(skip_market_data: bool = False):
 
         logger.info("Total trade records processed: %d", total)
 
-        # Step 4: Backfill market data
+        # Step 5: Backfill market data
         if not skip_market_data:
             await backfill_market_data(factory)
         else:
