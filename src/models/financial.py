@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, Numeric, String, func
+from sqlalchemy import BigInteger, Date, DateTime, Numeric, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.postgres import Base
@@ -17,7 +17,7 @@ class StockDaily(Base):
     low: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     close: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     adj_close: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
-    volume: Mapped[int | None] = mapped_column()
+    volume: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
