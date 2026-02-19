@@ -136,4 +136,11 @@ celery_app.conf.beat_schedule = {
     },
 }
 
-celery_app.autodiscover_tasks(["src.tasks"])
+celery_app.conf.include = [
+    "src.tasks.ingestion_tasks",
+    "src.tasks.legislation_tasks",
+    "src.tasks.network_tasks",
+    "src.tasks.media_tasks",
+    "src.tasks.ml_tasks",
+    "src.tasks.signal_tasks",
+]

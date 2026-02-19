@@ -36,14 +36,26 @@ async def _run_collector(collector_cls):
 
 @celery_app.task(name="src.tasks.ingestion_tasks.collect_house_trades")
 def collect_house_trades():
-    from src.ingestion.trades.house_watcher import HouseWatcherCollector
-    asyncio.run(_run_collector(HouseWatcherCollector))
+    """Collect House trades: try S3 watcher first, fall back to House Clerk scraper."""
+    try:
+        from src.ingestion.trades.house_watcher import HouseWatcherCollector
+        asyncio.run(_run_collector(HouseWatcherCollector))
+    except Exception as e:
+        logger.warning("House Watcher S3 failed (%s), falling back to House Clerk scraper", e)
+        from src.ingestion.trades.house_clerk import HouseClerkCollector
+        asyncio.run(_run_collector(HouseClerkCollector))
 
 
 @celery_app.task(name="src.tasks.ingestion_tasks.collect_senate_trades")
 def collect_senate_trades():
-    from src.ingestion.trades.senate_watcher import SenateWatcherCollector
-    asyncio.run(_run_collector(SenateWatcherCollector))
+    """Collect Senate trades: try S3 watcher first, fall back to GitHub CSV."""
+    try:
+        from src.ingestion.trades.senate_watcher import SenateWatcherCollector
+        asyncio.run(_run_collector(SenateWatcherCollector))
+    except Exception as e:
+        logger.warning("Senate Watcher S3 failed (%s), falling back to GitHub CSV", e)
+        from src.ingestion.trades.github_senate import GitHubSenateCollector
+        asyncio.run(_run_collector(GitHubSenateCollector))
 
 
 @celery_app.task(name="src.tasks.ingestion_tasks.collect_house_clerk_trades")
