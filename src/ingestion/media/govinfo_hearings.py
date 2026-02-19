@@ -37,7 +37,7 @@ class GovInfoHearingCollector(BaseCollector):
     def __init__(
         self,
         api_key: str | None = None,
-        congress: int = 118,
+        congress: int = 119,
         offset: int = 0,
         page_size: int = 100,
     ) -> None:
@@ -46,6 +46,8 @@ class GovInfoHearingCollector(BaseCollector):
         self.congress = congress
         self.offset = offset
         self.page_size = page_size
+        # Congress N starts in odd year: 2025 for 119th, 2023 for 118th, etc.
+        self.congress_start_year = 2025 - 2 * (119 - congress)
 
     async def collect(self) -> list[dict[str, Any]]:
         if not self.api_key:
@@ -53,22 +55,22 @@ class GovInfoHearingCollector(BaseCollector):
             return []
 
         results: list[dict[str, Any]] = []
+        # Use the collections endpoint: /collections/CHRG/{startDate}
+        start_date = f"{self.congress_start_year}-01-01T00:00:00Z"
         params = {
             "api_key": self.api_key,
-            "collection": "CHRG",
-            "congress": str(self.congress),
             "offset": self.offset,
             "pageSize": self.page_size,
         }
 
         data = await self.fetch_json(
-            f"{GOVINFO_API_BASE}/search",
+            f"{GOVINFO_API_BASE}/collections/CHRG/{start_date}",
             params=params,
         )
         if not data:
             return []
 
-        packages = data.get("results", [])
+        packages = data.get("packages", [])
         for pkg in packages:
             package_id = pkg.get("packageId", "")
             if not package_id:

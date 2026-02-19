@@ -71,14 +71,14 @@ class VoteviewCollector(BaseCollector):
         if pd.isna(dim1) and pd.isna(dim2):
             return None
 
-        # Normalize chamber
+        # Normalize chamber — skip president records
         chamber_code = raw.get("chamber", "")
         if chamber_code == "Senate":
             chamber = "senate"
         elif chamber_code == "House":
             chamber = "house"
         else:
-            chamber = None
+            return None  # Skip president/other non-congressional records
 
         # Parse party
         party_code = raw.get("party_code")
@@ -107,6 +107,6 @@ class VoteviewCollector(BaseCollector):
             "congress_number": int(raw.get("congress", 0)),
             "chamber": chamber,
             "party": party,
-            "state": raw.get("state_abbrev", ""),
+            "state": raw.get("state_abbrev", "")[:2] if raw.get("state_abbrev") else None,
             "full_name": full_name,
         }

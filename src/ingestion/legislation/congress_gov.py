@@ -200,7 +200,7 @@ class CongressBillCollector(BaseCollector):
         bill_id = f"{bill_type}{number}-{congress}"
 
         introduced = _parse_date(raw.get("introducedDate", ""))
-        latest_action = raw.get("latestAction", {})
+        latest_action = raw.get("latestAction") or {}
         latest_action_date = _parse_date(latest_action.get("actionDate", ""))
         latest_action_text = latest_action.get("text", "")
 
@@ -364,7 +364,19 @@ class CongressHearingCollector(BaseCollector):
             if not hearings:
                 break
 
-            all_hearings.extend(hearings)
+            # Each hearing in the list only has summary fields.
+            # Fetch detail to get title, date, etc.
+            for hearing in hearings:
+                detail_url = hearing.get("url")
+                if not detail_url:
+                    continue
+                detail = await self.fetch_json(
+                    detail_url,
+                    params={"api_key": settings.congress_gov_api_key, "format": "json"},
+                )
+                if detail and "hearing" in detail:
+                    all_hearings.append(detail["hearing"])
+
             offset += limit
 
             if not data.get("pagination", {}).get("next"):

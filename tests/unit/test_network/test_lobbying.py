@@ -18,7 +18,8 @@ class TestLobbyingFilingTransform:
     def test_transform_basic_filing(self):
         raw = {
             "filing_uuid": "abc-123-def",
-            "filing_type": "report",
+            "filing_type": "RR",
+            "filing_type_display": "Registration",
             "filing_year": 2024,
             "filing_period": "Q1",
             "filing_date": "2024-04-15",
@@ -34,17 +35,17 @@ class TestLobbyingFilingTransform:
                 "country": "USA",
                 "state": "CA",
             },
-            "lobbyists": [
-                {
-                    "lobbyist": {"first_name": "John", "last_name": "Smith"},
-                    "covered_official_position": "Former Senator",
-                },
-            ],
             "lobbying_activities": [
                 {
                     "general_issue_code": "CPT",
                     "description": "Issues related to H.R. 1234 and S. 567",
                     "government_entities": [{"name": "U.S. Senate"}],
+                    "lobbyists": [
+                        {
+                            "lobbyist": {"first_name": "John", "last_name": "Smith"},
+                            "covered_official_position": "Former Senator",
+                        },
+                    ],
                 },
             ],
         }

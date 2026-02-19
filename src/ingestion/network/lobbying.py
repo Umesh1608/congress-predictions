@@ -34,10 +34,9 @@ class LobbyingFilingCollector(BaseCollector):
     source_name = "senate_lda"
     rate_limiter = _lda_rate_limiter
 
-    def __init__(self, filing_year: int | None = None, filing_type: str = "report") -> None:
+    def __init__(self, filing_year: int | None = None) -> None:
         super().__init__()
         self.filing_year = filing_year or date.today().year
-        self.filing_type = filing_type  # "registration" or "report"
         self.max_pages = 50  # Safety limit
 
     async def collect(self) -> list[dict[str, Any]]:
@@ -46,7 +45,6 @@ class LobbyingFilingCollector(BaseCollector):
         url = f"{LDA_API_BASE}/filings/"
         params: dict[str, Any] = {
             "filing_year": self.filing_year,
-            "filing_type": self.filing_type,
             "page_size": 25,
         }
 
@@ -102,24 +100,14 @@ class LobbyingFilingCollector(BaseCollector):
             "state": client.get("state"),
         }
 
-        # Extract lobbyists
-        lobbyists_raw = raw.get("lobbyists", []) or []
-        lobbyists_data = []
-        for lob in lobbyists_raw:
-            covered = lob.get("covered_official_position", "")
-            lobbyists_data.append({
-                "name": _normalize_lobbyist_name(lob),
-                "covered_position": covered if covered else None,
-                "is_former_congress": _is_former_congress(covered),
-                "is_former_executive": _is_former_executive(covered),
-            })
-
-        # Extract issues and bills
+        # Extract issues, bills, and lobbyists from lobbying_activities
         activities = raw.get("lobbying_activities", []) or []
         issue_codes = []
         specific_issues_list = []
         lobbied_bills = []
         gov_entities = []
+        lobbyists_data = []
+        seen_lobbyist_names: set[str] = set()
 
         for activity in activities:
             code = activity.get("general_issue_code")
@@ -134,6 +122,19 @@ class LobbyingFilingCollector(BaseCollector):
                 entity_name = entity.get("name", "")
                 if entity_name:
                     gov_entities.append(entity_name)
+
+            # Lobbyists are nested inside each activity
+            for lob in (activity.get("lobbyists", []) or []):
+                covered = lob.get("covered_official_position", "")
+                name = _normalize_lobbyist_name(lob)
+                if name and name not in seen_lobbyist_names:
+                    seen_lobbyist_names.add(name)
+                    lobbyists_data.append({
+                        "name": name,
+                        "covered_position": covered if covered else None,
+                        "is_former_congress": _is_former_congress(covered),
+                        "is_former_executive": _is_former_executive(covered),
+                    })
 
         # Parse lobbied bills from specific issues text
         # LDA filings sometimes list bill numbers in the description
@@ -166,7 +167,7 @@ class LobbyingFilingCollector(BaseCollector):
 
         return {
             "filing_uuid": filing_uuid,
-            "filing_type": self.filing_type,
+            "filing_type": raw.get("filing_type_display", raw.get("filing_type", "")),
             "filing_year": self.filing_year,
             "filing_period": raw.get("filing_period"),
             "filing_date": filing_date,

@@ -56,7 +56,7 @@ def collect_campaign_committees():
         engine = create_async_engine(settings.database_url)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-        api_key = settings.fmp_api_key  # FEC uses same data.gov key pattern
+        api_key = settings.fec_api_key
         collector = FECCommitteeCollector(api_key=api_key)
         try:
             records = await collector.run()

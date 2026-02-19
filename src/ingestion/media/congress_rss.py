@@ -24,8 +24,6 @@ DEFAULT_FEEDS: dict[str, str] = {
     "house_floor": "https://www.congress.gov/rss/house-floor-today.xml",
     "senate_floor": "https://www.congress.gov/rss/senate-floor-today.xml",
     "most_viewed_bills": "https://www.congress.gov/rss/most-viewed-bills.xml",
-    "new_bills": "https://www.congress.gov/rss/bill/new.xml",
-    "recently_active": "https://www.congress.gov/rss/bill/recently-active.xml",
 }
 
 

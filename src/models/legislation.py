@@ -68,10 +68,10 @@ class BillCosponsor(Base):
 class Committee(Base):
     __tablename__ = "committee"
 
-    system_code: Mapped[str] = mapped_column(String(10), primary_key=True)  # e.g. HSAG00
+    system_code: Mapped[str] = mapped_column(String(20), primary_key=True)  # e.g. HSAG00
     name: Mapped[str] = mapped_column(String(300))
     chamber: Mapped[str] = mapped_column(String(10))  # house / senate / joint
-    parent_code: Mapped[str | None] = mapped_column(String(10))  # for subcommittees
+    parent_code: Mapped[str | None] = mapped_column(String(20))  # for subcommittees
     url: Mapped[str | None] = mapped_column(Text)
     is_current: Mapped[bool] = mapped_column(default=True)
     jurisdiction: Mapped[str | None] = mapped_column(Text)  # free-text jurisdiction description
