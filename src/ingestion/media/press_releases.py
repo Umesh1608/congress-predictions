@@ -23,25 +23,13 @@ _press_rate_limiter = RateLimiter(max_calls=1, period_seconds=2.0)
 # Format: {bioguide_id: (member_name, rss_url)}
 # These are members known for high trading activity
 MEMBER_RSS_FEEDS: dict[str, tuple[str, str]] = {
-    "P000197": (
-        "Nancy Pelosi",
-        "https://pelosi.house.gov/news/press-releases/rss.xml",
+    "H000601": (
+        "Bill Hagerty",
+        "https://www.hagerty.senate.gov/feed/",
     ),
-    "T000278": (
-        "Tommy Tuberville",
-        "https://www.tuberville.senate.gov/feed/",
-    ),
-    "H001089": (
-        "Josh Hawley",
-        "https://www.hawley.senate.gov/rss/feeds/press_releases",
-    ),
-    "C001075": (
-        "Bill Cassidy",
-        "https://www.cassidy.senate.gov/rss/feeds/press_releases",
-    ),
-    "W000437": (
-        "Roger Wicker",
-        "https://www.wicker.senate.gov/rss/feeds/press_releases",
+    "R000618": (
+        "Pete Ricketts",
+        "https://www.ricketts.senate.gov/feed/",
     ),
 }
 

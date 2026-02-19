@@ -25,11 +25,6 @@ YT_RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 # Format: {channel_id: channel_name}
 DEFAULT_CHANNELS: dict[str, str] = {
     "UCb--64Gl51jIEVE-GLDAVTg": "C-SPAN",
-    "UCY4sMEDJqVFBJP6n1jUvV6A": "Senate Judiciary Committee",
-    "UCPBr2CJOrmLOsMfN-vIpTcg": "House Financial Services Committee",
-    "UC6Z4cMDm-6xSdXfYEvMZfuA": "Senate Finance Committee",
-    "UCMJTbGLl3u_gp6mPeHSK-yg": "Senate Banking Committee",
-    "UCsSCVWFT9_mWRiNHqLbZp_A": "House Ways and Means Committee",
 }
 
 _yt_rate_limiter = RateLimiter(max_calls=2, period_seconds=1.0)

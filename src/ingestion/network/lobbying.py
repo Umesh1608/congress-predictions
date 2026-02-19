@@ -34,10 +34,11 @@ class LobbyingFilingCollector(BaseCollector):
     source_name = "senate_lda"
     rate_limiter = _lda_rate_limiter
 
-    def __init__(self, filing_year: int | None = None) -> None:
+    def __init__(self, filing_year: int | None = None, max_pages: int = 200) -> None:
         super().__init__()
+        # Default to current year, but fall back to previous year if early in January
         self.filing_year = filing_year or date.today().year
-        self.max_pages = 50  # Safety limit
+        self.max_pages = max_pages
 
     async def collect(self) -> list[dict[str, Any]]:
         """Fetch filings from Senate LDA API with pagination."""
