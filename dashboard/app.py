@@ -15,6 +15,7 @@ pages = {
     "Member Explorer": "dashboard.pages.member_explorer",
     "Trade Feed": "dashboard.pages.trade_feed",
     "Network Graph": "dashboard.pages.network_graph",
+    "Screener": "dashboard.pages.screener",
     "Signals": "dashboard.pages.signals",
     "Backtesting": "dashboard.pages.backtesting",
 }
@@ -40,6 +41,9 @@ elif selection == "Trade Feed":
     render()
 elif selection == "Network Graph":
     from dashboard.pages.network_graph import render
+    render()
+elif selection == "Screener":
+    from dashboard.pages.screener import render
     render()
 elif selection == "Signals":
     from dashboard.pages.signals import render

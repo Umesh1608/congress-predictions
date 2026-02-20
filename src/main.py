@@ -18,6 +18,7 @@ from src.api.v1.media import router as media_router
 from src.api.v1.predictions import router as predictions_router
 from src.api.v1.signals import router as signals_router
 from src.api.v1.health import router as health_router
+from src.api.v1.recommendations import router as recommendations_router
 
 
 @asynccontextmanager
@@ -57,6 +58,7 @@ app.include_router(network_router, prefix="/api/v1")
 app.include_router(media_router, prefix="/api/v1")
 app.include_router(predictions_router, prefix="/api/v1")
 app.include_router(signals_router, prefix="/api/v1")
+app.include_router(recommendations_router, prefix="/api/v1")
 app.include_router(health_router)
 
 

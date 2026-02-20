@@ -127,6 +127,23 @@ class CongressAPI:
     def get_member_paths(self, bioguide_id: str, ticker: str) -> dict:
         return self._get(f"/network/member/{bioguide_id}/paths-to/{ticker}")
 
+    # Recommendations
+    def get_recommendations(
+        self,
+        portfolio_size: float = 3000,
+        top_n: int = 5,
+        min_signal_strength: float = 0.3,
+    ) -> dict:
+        return self._get(
+            "/recommendations",
+            params={
+                "portfolio_size": portfolio_size,
+                "top_n": top_n,
+                "min_signal_strength": min_signal_strength,
+            },
+            cache_ttl=60,
+        )
+
     # Health
     def get_health(self) -> dict:
         return self._get("/health" if self.base_url.endswith("/v1") else "/../health")
