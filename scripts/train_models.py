@@ -11,6 +11,7 @@ import logging
 import sys
 
 import numpy as np
+import pandas as pd
 
 from src.db.postgres import async_session_factory
 from src.ml.dataset_fast import build_dataset_fast, feature_columns
@@ -83,16 +84,19 @@ async def main():
                 X_tune = X_raw[:, keep_mask]
                 y_tune = df["profitable"].values.astype(float)
                 w_tune = df["sample_weight"].values.astype(float)
+                dates_tune = pd.to_datetime(df["transaction_date"]).values
 
                 logger.info("Running Optuna LightGBM tuning (%d trials)...", n_trials)
                 tuned_lgbm_params = optuna_tune_lgbm(
-                    X_tune, y_tune, w_tune, n_folds=3, n_trials=n_trials,
+                    X_tune, y_tune, w_tune, dates=dates_tune,
+                    n_folds=3, n_trials=n_trials,
                 )
 
                 if use_catboost:
                     logger.info("Running Optuna CatBoost tuning (%d trials)...", n_trials)
                     tuned_catboost_params = optuna_tune_catboost(
-                        X_tune, y_tune, w_tune, n_folds=3, n_trials=n_trials,
+                        X_tune, y_tune, w_tune, dates=dates_tune,
+                        n_folds=3, n_trials=n_trials,
                     )
 
             results = await train_models_cv(

@@ -81,16 +81,19 @@ class ModelTrainer:
             X_tune = X_raw[:, keep_mask]
             y_tune = df["profitable"].values.astype(float)
             w_tune = df["sample_weight"].values.astype(float)
+            dates_tune = pd.to_datetime(df["transaction_date"]).values
 
             logger.info("Running Optuna LightGBM tuning (%d trials)...", self.optuna_trials)
             tuned_lgbm_params = optuna_tune_lgbm(
-                X_tune, y_tune, w_tune, n_folds=3, n_trials=self.optuna_trials
+                X_tune, y_tune, w_tune, dates=dates_tune,
+                n_folds=3, n_trials=self.optuna_trials,
             )
 
             if self.use_catboost:
                 logger.info("Running Optuna CatBoost tuning (%d trials)...", self.optuna_trials)
                 tuned_catboost_params = optuna_tune_catboost(
-                    X_tune, y_tune, w_tune, n_folds=3, n_trials=self.optuna_trials
+                    X_tune, y_tune, w_tune, dates=dates_tune,
+                    n_folds=3, n_trials=self.optuna_trials,
                 )
 
         # Run temporal CV training
@@ -116,12 +119,24 @@ async def train_models_cv(
     tuned_lgbm_params: dict | None = None,
     tuned_catboost_params: dict | None = None,
     artifact_dir: str = ARTIFACT_BASE_DIR,
+    purge_days: int = 45,
+    embargo_days: int = 14,
 ) -> dict[str, dict[str, float]]:
     """Train all models with temporal k-fold cross-validation.
 
     Data is sorted by transaction_date. For k folds, each fold uses
     the first (i+1)/k of data for training and the next chunk for validation.
-    This ensures no future leakage — always train on past, test on future.
+
+    Purge gap (default 45 days): removes training samples whose
+    transaction_date is within purge_days before the split boundary.
+    These trades could have disclosure dates that fall in the test period,
+    leaking information about market reactions. 45 days matches the
+    maximum STOCK Act reporting lag.
+
+    Embargo (default 14 days): skips test samples whose transaction_date
+    is within embargo_days after the split boundary. Rolling features
+    (e.g. 30d sentiment, 21d volatility) for these samples overlap with
+    the training period, creating autocorrelation leakage.
     """
     feat_cols = feature_columns(df)
 
@@ -140,13 +155,22 @@ async def train_models_cv(
     y_return = df["actual_return"].fillna(0).values.astype(float)
     sample_weights = df["sample_weight"].values.astype(float)
 
+    # Transaction dates for purge/embargo computation
+    dates = pd.to_datetime(df["transaction_date"]).values
+
     n = len(X)
     logger.info("Features (%d): %s", len(feat_cols), feat_cols)
-    logger.info("Running %d-fold temporal cross-validation on %d samples", n_folds, n)
+    logger.info(
+        "Running %d-fold temporal CV on %d samples (purge=%dd, embargo=%dd)",
+        n_folds, n, purge_days, embargo_days,
+    )
 
     # Temporal CV: fold i trains on [0, split_i), validates on [split_i, split_i+1)
     min_train_frac = 0.5
     fold_size = int(n * (1 - min_train_frac) / n_folds)
+
+    purge_td = np.timedelta64(purge_days, "D")
+    embargo_td = np.timedelta64(embargo_days, "D")
 
     model_names = ["trade_predictor", "return_predictor", "anomaly_detector", "ensemble"]
     if use_catboost:
@@ -154,19 +178,46 @@ async def train_models_cv(
     fold_metrics: dict[str, list[dict]] = {name: [] for name in model_names}
 
     for fold in range(n_folds):
-        train_end = int(n * min_train_frac) + fold * fold_size
-        val_end = min(train_end + fold_size, n)
-        if train_end >= n or val_end <= train_end:
+        train_end_idx = int(n * min_train_frac) + fold * fold_size
+        val_end_idx = min(train_end_idx + fold_size, n)
+        if train_end_idx >= n or val_end_idx <= train_end_idx:
             break
 
-        X_train, X_val = X[:train_end], X[train_end:val_end]
-        y_class_train, y_class_val = y_class[:train_end], y_class[train_end:val_end]
-        y_return_train, y_return_val = y_return[:train_end], y_return[train_end:val_end]
-        w_train = sample_weights[:train_end]
+        # The split boundary date is the transaction_date at the split point
+        split_date = dates[train_end_idx]
 
+        # PURGE: remove training samples within purge_days before split
+        # These trades could have disclosure dates that fall in the test period
+        purge_cutoff = split_date - purge_td
+        train_mask = dates[:train_end_idx] < purge_cutoff
+        train_idx = np.where(train_mask)[0]
+
+        # EMBARGO: skip test samples within embargo_days after split
+        # Their rolling features overlap with the training period
+        embargo_cutoff = split_date + embargo_td
+        val_mask = dates[train_end_idx:val_end_idx] >= embargo_cutoff
+        val_idx = train_end_idx + np.where(val_mask)[0]
+
+        if len(train_idx) < 100 or len(val_idx) < 50:
+            logger.warning(
+                "  Fold %d/%d: too few samples after purge/embargo "
+                "(train=%d, val=%d) — skipping",
+                fold + 1, n_folds, len(train_idx), len(val_idx),
+            )
+            continue
+
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_class_train = y_class[train_idx]
+        y_class_val = y_class[val_idx]
+        y_return_train = y_return[train_idx]
+        y_return_val = y_return[val_idx]
+        w_train = sample_weights[train_idx]
+
+        purged = train_end_idx - len(train_idx)
+        embargoed = (val_end_idx - train_end_idx) - len(val_idx)
         logger.info(
-            "  Fold %d/%d: train=%d, val=%d",
-            fold + 1, n_folds, len(X_train), len(X_val),
+            "  Fold %d/%d: train=%d (purged %d), val=%d (embargoed %d)",
+            fold + 1, n_folds, len(X_train), purged, len(X_val), embargoed,
         )
 
         # Trade Predictor (LightGBM) with sample weights
@@ -201,22 +252,26 @@ async def train_models_cv(
             )
             fold_metrics["catboost"].append(m)
 
-        # Ensemble
-        tp_proba = np.concatenate([tp.predict_proba(X_train), tp.predict_proba(X_val)])
-        rp_scores = np.concatenate([rp.predict(X_train), rp.predict(X_val)])
-        X_a_all = np.vstack([X_a_train, X_val[:, anomaly_idx]])
-        ad_scores = ad.predict_proba(X_a_all)
+        # Ensemble — build meta-features from base model outputs
+        tp_proba_train = tp.predict_proba(X_train)
+        tp_proba_val = tp.predict_proba(X_val)
+        rp_score_train = rp.predict(X_train)
+        rp_score_val = rp.predict(X_val)
+        ad_score_train = ad.predict_proba(X_a_train)
+        ad_score_val = ad.predict_proba(X_val[:, anomaly_idx])
 
         timing_idx = feat_cols.index("timing_suspicion_score") if "timing_suspicion_score" in feat_cols else None
         sentiment_idx = feat_cols.index("avg_sentiment_7d") if "avg_sentiment_7d" in feat_cols else None
-        all_X = np.vstack([X_train, X_val])
 
-        meta_cols = [tp_proba, rp_scores, ad_scores]
-        meta_cols.append(all_X[:, timing_idx] if timing_idx is not None else np.zeros(len(all_X)))
-        meta_cols.append(all_X[:, sentiment_idx] if sentiment_idx is not None else np.zeros(len(all_X)))
+        def _build_meta(tp_p, rp_s, ad_s, Xf):
+            cols = [tp_p, rp_s, ad_s]
+            cols.append(Xf[:, timing_idx] if timing_idx is not None else np.zeros(len(Xf)))
+            cols.append(Xf[:, sentiment_idx] if sentiment_idx is not None else np.zeros(len(Xf)))
+            return np.column_stack(cols)
 
-        meta = np.column_stack(meta_cols)
-        meta_train, meta_val = meta[:len(X_train)], meta[len(X_train):]
+        meta_train = _build_meta(tp_proba_train, rp_score_train, ad_score_train, X_train)
+        meta_val = _build_meta(tp_proba_val, rp_score_val, ad_score_val, X_val)
+
         ens = EnsembleModel()
         ens.feature_columns = EnsembleModel.META_FEATURES
         ens.train(meta_train, y_class_train, meta_val, y_class_val)
@@ -255,12 +310,29 @@ async def train_models_cv(
         for i in top_idx:
             logger.info("    %3d. %-35s %6.1f", i, feat_cols[i], importances[i])
 
-    # Final train on all data (80/20 split for saved model)
+    # Final train on all data (80/20 split with purge/embargo for saved model)
     split_idx = int(n * 0.8)
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_class_train, y_class_val = y_class[:split_idx], y_class[split_idx:]
-    y_return_train, y_return_val = y_return[:split_idx], y_return[split_idx:]
-    w_final_train = sample_weights[:split_idx]
+    final_split_date = dates[split_idx]
+    final_purge_cutoff = final_split_date - purge_td
+    final_embargo_cutoff = final_split_date + embargo_td
+
+    final_train_mask = dates[:split_idx] < final_purge_cutoff
+    final_train_idx = np.where(final_train_mask)[0]
+    final_val_mask = dates[split_idx:] >= final_embargo_cutoff
+    final_val_idx = split_idx + np.where(final_val_mask)[0]
+
+    logger.info(
+        "  Final model: train=%d (purged %d), val=%d (embargoed %d)",
+        len(final_train_idx), split_idx - len(final_train_idx),
+        len(final_val_idx), (n - split_idx) - len(final_val_idx),
+    )
+
+    X_train, X_val = X[final_train_idx], X[final_val_idx]
+    y_class_train = y_class[final_train_idx]
+    y_class_val = y_class[final_val_idx]
+    y_return_train = y_return[final_train_idx]
+    y_return_val = y_return[final_val_idx]
+    w_final_train = sample_weights[final_train_idx]
 
     version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
@@ -280,23 +352,28 @@ async def train_models_cv(
     anomaly_idx = [feat_cols.index(c) for c in anomaly_cols]
     anomaly_det = AnomalyDetector()
     anomaly_det.feature_columns = anomaly_cols
-    anomaly_det.train(X[:, anomaly_idx], y_class)
+    # Anomaly detector is unsupervised — train on all non-purged training data
+    anomaly_det.train(X[final_train_idx][:, anomaly_idx], y_class[final_train_idx])
     await _save_artifact(session, anomaly_det, version, results["anomaly_detector"], anomaly_cols, artifact_dir)
 
-    # Ensemble on final split
-    tp_proba = trade_pred.predict_proba(X)
-    rp_scores = return_pred.predict(X)
-    ad_scores = anomaly_det.predict_proba(X[:, anomaly_idx])
+    # Ensemble on final split (using purged train + embargoed val)
     timing_idx = feat_cols.index("timing_suspicion_score") if "timing_suspicion_score" in feat_cols else None
     sentiment_idx = feat_cols.index("avg_sentiment_7d") if "avg_sentiment_7d" in feat_cols else None
-    meta = np.column_stack([
-        tp_proba, rp_scores, ad_scores,
-        X[:, timing_idx] if timing_idx is not None else np.zeros(n),
-        X[:, sentiment_idx] if sentiment_idx is not None else np.zeros(n),
-    ])
+
+    def _build_meta_final(Xf):
+        tp_p = trade_pred.predict_proba(Xf)
+        rp_s = return_pred.predict(Xf)
+        ad_s = anomaly_det.predict_proba(Xf[:, anomaly_idx])
+        cols = [tp_p, rp_s, ad_s]
+        cols.append(Xf[:, timing_idx] if timing_idx is not None else np.zeros(len(Xf)))
+        cols.append(Xf[:, sentiment_idx] if sentiment_idx is not None else np.zeros(len(Xf)))
+        return np.column_stack(cols)
+
+    meta_train = _build_meta_final(X_train)
+    meta_val = _build_meta_final(X_val)
     ensemble = EnsembleModel()
     ensemble.feature_columns = EnsembleModel.META_FEATURES
-    ensemble.train(meta[:split_idx], y_class_train, meta[split_idx:], y_class_val)
+    ensemble.train(meta_train, y_class_train, meta_val, y_class_val)
     await _save_artifact(session, ensemble, version, results["ensemble"], EnsembleModel.META_FEATURES, artifact_dir)
 
     return results
@@ -373,11 +450,55 @@ async def _save_artifact(
 # Optuna hyperparameter tuning
 # ---------------------------------------------------------------------------
 
+def _temporal_cv_splits(
+    n: int,
+    dates: np.ndarray | None,
+    n_folds: int,
+    purge_days: int = 45,
+    embargo_days: int = 14,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Generate purge/embargo-aware temporal CV splits.
+
+    Returns list of (train_indices, val_indices) tuples.
+    If dates is None, falls back to index-based splits without purge/embargo.
+    """
+    min_train_frac = 0.5
+    fold_size = int(n * (1 - min_train_frac) / n_folds)
+
+    splits = []
+    for fold in range(n_folds):
+        train_end = int(n * min_train_frac) + fold * fold_size
+        val_end = min(train_end + fold_size, n)
+        if train_end >= n or val_end <= train_end:
+            break
+
+        if dates is not None:
+            split_date = dates[train_end]
+            purge_cutoff = split_date - np.timedelta64(purge_days, "D")
+            embargo_cutoff = split_date + np.timedelta64(embargo_days, "D")
+
+            train_idx = np.where(dates[:train_end] < purge_cutoff)[0]
+            val_idx = train_end + np.where(dates[train_end:val_end] >= embargo_cutoff)[0]
+        else:
+            train_idx = np.arange(train_end)
+            val_idx = np.arange(train_end, val_end)
+
+        if len(train_idx) >= 100 and len(val_idx) >= 50:
+            splits.append((train_idx, val_idx))
+
+    return splits
+
+
 def optuna_tune_lgbm(
     X: np.ndarray, y: np.ndarray, sample_weights: np.ndarray,
+    dates: np.ndarray | None = None,
     n_folds: int = 3, n_trials: int = 50,
+    purge_days: int = 45, embargo_days: int = 14,
 ) -> dict:
-    """Use Optuna to find optimal LightGBM hyperparameters with temporal CV."""
+    """Use Optuna to find optimal LightGBM hyperparameters with temporal CV.
+
+    Applies purge/embargo gaps when dates are provided.
+    """
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -386,10 +507,12 @@ def optuna_tune_lgbm(
         return {}
 
     import lightgbm as lgb
+    from sklearn.metrics import roc_auc_score
 
-    n = len(X)
-    min_train_frac = 0.5
-    fold_size = int(n * (1 - min_train_frac) / n_folds)
+    splits = _temporal_cv_splits(len(X), dates, n_folds, purge_days, embargo_days)
+    if not splits:
+        logger.warning("No valid CV splits for Optuna LightGBM — using defaults")
+        return {}
 
     def objective(trial):
         params = {
@@ -409,23 +532,16 @@ def optuna_tune_lgbm(
         }
 
         aucs = []
-        for fold in range(n_folds):
-            train_end = int(n * min_train_frac) + fold * fold_size
-            val_end = min(train_end + fold_size, n)
-            if train_end >= n or val_end <= train_end:
-                break
-
-            X_train, X_val = X[:train_end], X[train_end:val_end]
-            y_train, y_val = y[:train_end], y[train_end:val_end]
-            w_train = sample_weights[:train_end]
-
+        for train_idx, val_idx in splits:
             model = lgb.LGBMClassifier(**params)
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], sample_weight=w_train)
-
-            from sklearn.metrics import roc_auc_score
-            proba = model.predict_proba(X_val)[:, 1]
+            model.fit(
+                X[train_idx], y[train_idx],
+                eval_set=[(X[val_idx], y[val_idx])],
+                sample_weight=sample_weights[train_idx],
+            )
+            proba = model.predict_proba(X[val_idx])[:, 1]
             try:
-                auc = roc_auc_score(y_val, proba)
+                auc = roc_auc_score(y[val_idx], proba)
             except ValueError:
                 auc = 0.5
             aucs.append(auc)
@@ -442,9 +558,14 @@ def optuna_tune_lgbm(
 
 def optuna_tune_catboost(
     X: np.ndarray, y: np.ndarray, sample_weights: np.ndarray,
+    dates: np.ndarray | None = None,
     n_folds: int = 3, n_trials: int = 50,
+    purge_days: int = 45, embargo_days: int = 14,
 ) -> dict:
-    """Use Optuna to find optimal CatBoost hyperparameters with temporal CV."""
+    """Use Optuna to find optimal CatBoost hyperparameters with temporal CV.
+
+    Applies purge/embargo gaps when dates are provided.
+    """
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -455,9 +576,10 @@ def optuna_tune_catboost(
 
     from sklearn.metrics import roc_auc_score
 
-    n = len(X)
-    min_train_frac = 0.5
-    fold_size = int(n * (1 - min_train_frac) / n_folds)
+    splits = _temporal_cv_splits(len(X), dates, n_folds, purge_days, embargo_days)
+    if not splits:
+        logger.warning("No valid CV splits for Optuna CatBoost — using defaults")
+        return {}
 
     def objective(trial):
         params = {
@@ -474,24 +596,15 @@ def optuna_tune_catboost(
         }
 
         aucs = []
-        for fold in range(n_folds):
-            train_end = int(n * min_train_frac) + fold * fold_size
-            val_end = min(train_end + fold_size, n)
-            if train_end >= n or val_end <= train_end:
-                break
-
-            X_train, X_val = X[:train_end], X[train_end:val_end]
-            y_train, y_val = y[:train_end], y[train_end:val_end]
-            w_train = sample_weights[:train_end]
-
+        for train_idx, val_idx in splits:
             model = CatBoostClassifier(**params)
-            train_pool = Pool(X_train, y_train, weight=w_train)
-            val_pool = Pool(X_val, y_val)
+            train_pool = Pool(X[train_idx], y[train_idx], weight=sample_weights[train_idx])
+            val_pool = Pool(X[val_idx], y[val_idx])
             model.fit(train_pool, eval_set=val_pool, early_stopping_rounds=50, verbose=0)
 
-            proba = model.predict_proba(X_val)[:, 1]
+            proba = model.predict_proba(X[val_idx])[:, 1]
             try:
-                auc = roc_auc_score(y_val, proba)
+                auc = roc_auc_score(y[val_idx], proba)
             except ValueError:
                 auc = 0.5
             aucs.append(auc)
