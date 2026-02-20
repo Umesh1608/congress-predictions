@@ -48,6 +48,7 @@ class ReturnPredictor(BasePredictor):
         y_train: np.ndarray,
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
+        sample_weight: np.ndarray | None = None,
     ) -> dict[str, float]:
         """Train XGBoost regressor."""
         xgb = _get_xgb()
@@ -58,6 +59,8 @@ class ReturnPredictor(BasePredictor):
         if X_val is not None and y_val is not None:
             fit_params["eval_set"] = [(X_val, y_val)]
             fit_params["verbose"] = False
+        if sample_weight is not None:
+            fit_params["sample_weight"] = sample_weight
 
         self.model.fit(X_train, y_train, **fit_params)
 

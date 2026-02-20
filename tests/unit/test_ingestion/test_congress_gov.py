@@ -193,6 +193,32 @@ class TestCongressHearingTransform:
         result = self.collector.transform(raw)
         assert result is None
 
+    def test_transform_api_v3_format(self):
+        """Test transform with actual Congress.gov API v3 response format."""
+        raw = {
+            "chamber": "Senate",
+            "congress": 119,
+            "title": "BUSINESS MEETING",
+            "committees": [
+                {
+                    "name": "Senate Public Works Committee",
+                    "systemCode": "ssev00",
+                    "url": "https://api.congress.gov/v3/committee/senate/ssev00",
+                }
+            ],
+            "dates": [{"date": "2025-02-05"}],
+            "formats": [
+                {"type": "PDF", "url": "https://congress.gov/119/chrg/test.pdf"}
+            ],
+        }
+        result = self.collector.transform(raw)
+        assert result is not None
+        assert result["title"] == "BUSINESS MEETING"
+        assert result["hearing_date"] == date(2025, 2, 5)
+        assert result["committee_code"] == "ssev00"
+        assert result["chamber"] == "senate"
+        assert result["url"] == "https://congress.gov/119/chrg/test.pdf"
+
 
 class TestCurrentCongress:
     def test_current_congress_is_reasonable(self):

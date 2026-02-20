@@ -38,6 +38,12 @@ class TradePredictor(BasePredictor):
             "n_estimators": kwargs.get("n_estimators", 500),
             "max_depth": kwargs.get("max_depth", 6),
             "learning_rate": kwargs.get("learning_rate", 0.05),
+            "num_leaves": kwargs.get("num_leaves", 31),
+            "min_child_samples": kwargs.get("min_child_samples", 20),
+            "reg_alpha": kwargs.get("reg_alpha", 0.0),
+            "reg_lambda": kwargs.get("reg_lambda", 0.0),
+            "subsample": kwargs.get("subsample", 1.0),
+            "colsample_bytree": kwargs.get("colsample_bytree", 1.0),
             "class_weight": kwargs.get("class_weight", "balanced"),
             "random_state": kwargs.get("random_state", 42),
             "verbose": kwargs.get("verbose", -1),
@@ -51,6 +57,7 @@ class TradePredictor(BasePredictor):
         y_train: np.ndarray,
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
+        sample_weight: np.ndarray | None = None,
     ) -> dict[str, float]:
         """Train LightGBM classifier."""
         lgb = _get_lgbm()
@@ -60,6 +67,8 @@ class TradePredictor(BasePredictor):
         fit_params: dict[str, Any] = {}
         if X_val is not None and y_val is not None:
             fit_params["eval_set"] = [(X_val, y_val)]
+        if sample_weight is not None:
+            fit_params["sample_weight"] = sample_weight
 
         self.model.fit(X_train, y_train, **fit_params)
 

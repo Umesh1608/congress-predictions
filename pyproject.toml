@@ -47,6 +47,8 @@ ml = [
     "torch-geometric>=2.6.0",
     "transformers>=4.46.0",
     "spacy>=3.8.0",
+    "optuna>=3.6.0",
+    "catboost>=1.2.0",
 ]
 dashboard = [
     "streamlit>=1.41.0",

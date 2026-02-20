@@ -28,7 +28,11 @@ async def _train_all():
 
     try:
         async with async_session() as session:
-            trainer = ModelTrainer()
+            trainer = ModelTrainer(
+                horizon="180d",
+                n_folds=5,
+                use_catboost=True,
+            )
             results = await trainer.train_all(session)
             logger.info("Training complete: %s", results)
     finally:

@@ -195,14 +195,15 @@ congress_predictions/
 │   │   └── text_processing.py      # NLP pipeline: FinBERT sentiment, spaCy NER, ticker extraction
 │   ├── ml/                         # Phase 5: ML prediction engine
 │   │   ├── features.py             # FeatureBuilder: 6 feature groups (trade, member, market, legislative, sentiment, network)
-│   │   ├── dataset.py              # DatasetBuilder + TemporalSplitter (walk-forward CV, no leakage)
-│   │   ├── training.py             # ModelTrainer orchestrator (train all models, save artifacts)
+│   │   ├── dataset.py              # TemporalSplitter (walk-forward CV) + legacy DatasetBuilder (per-trade)
+│   │   ├── dataset_fast.py         # Bulk SQL dataset builder (build_dataset_fast) — 100x faster, 68 features
+│   │   ├── training.py             # ModelTrainer orchestrator (temporal CV, CatBoost, Optuna tuning, artifact saving)
 │   │   ├── predictor.py            # PredictionService (lazy-loaded singleton, batch predict)
 │   │   ├── evaluation.py           # Classifier/regressor/profit metrics
 │   │   └── models/
 │   │       ├── base.py             # BasePredictor ABC (train/predict/predict_proba/save/load)
-│   │       ├── trade_predictor.py  # LightGBM classifier (profitable at 5d)
-│   │       ├── return_predictor.py # XGBoost regressor (expected 5d return)
+│   │       ├── trade_predictor.py  # LightGBM classifier (profitable at horizon)
+│   │       ├── return_predictor.py # XGBoost regressor (expected return)
 │   │       ├── anomaly_model.py    # Isolation Forest (unusual patterns, market features excluded)
 │   │       └── ensemble.py         # Logistic Regression meta-learner (stacking)
 │   └── signals/                    # Phase 6: Signal generation

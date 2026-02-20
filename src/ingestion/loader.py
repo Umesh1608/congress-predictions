@@ -165,6 +165,8 @@ async def upsert_bills(session: AsyncSession, records: list[dict[str, Any]]) -> 
                 "subjects": stmt.excluded.subjects,
                 "committees": stmt.excluded.committees,
                 "actions": stmt.excluded.actions,
+                "sponsor_bioguide_id": stmt.excluded.sponsor_bioguide_id,
+                "sponsor_name": stmt.excluded.sponsor_name,
             },
         )
         result = await session.execute(stmt)

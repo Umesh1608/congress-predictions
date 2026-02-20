@@ -370,12 +370,15 @@ class CongressHearingCollector(BaseCollector):
                 detail_url = hearing.get("url")
                 if not detail_url:
                     continue
-                detail = await self.fetch_json(
-                    detail_url,
-                    params={"api_key": settings.congress_gov_api_key, "format": "json"},
-                )
-                if detail and "hearing" in detail:
-                    all_hearings.append(detail["hearing"])
+                try:
+                    detail = await self.fetch_json(
+                        detail_url,
+                        params={"api_key": settings.congress_gov_api_key, "format": "json"},
+                    )
+                    if detail and "hearing" in detail:
+                        all_hearings.append(detail["hearing"])
+                except Exception as e:
+                    logger.warning("Failed to fetch hearing detail %s: %s", detail_url, e)
 
             offset += limit
 
@@ -392,7 +395,18 @@ class CongressHearingCollector(BaseCollector):
         if not title:
             return None
 
-        hearing_date = _parse_date(raw.get("date", ""))
+        # Congress.gov API returns dates as a list: {"dates": [{"date": "2025-02-05"}]}
+        # Also support the simple "date" field for backwards compat with tests
+        hearing_date = None
+        dates_list = raw.get("dates")
+        if isinstance(dates_list, list) and dates_list:
+            first_date = dates_list[0]
+            if isinstance(first_date, dict):
+                hearing_date = _parse_date(first_date.get("date", ""))
+            elif isinstance(first_date, str):
+                hearing_date = _parse_date(first_date)
+        if not hearing_date:
+            hearing_date = _parse_date(raw.get("date", ""))
 
         chamber_raw = (raw.get("chamber") or "").lower()
         if "senate" in chamber_raw:
@@ -402,9 +416,14 @@ class CongressHearingCollector(BaseCollector):
         else:
             chamber = None
 
-        # Committee info
-        committee = raw.get("committee", {}) or {}
-        committee_code = committee.get("systemCode")
+        # Committee info — API returns "committees" (plural list) or "committee" (singular)
+        committee_code = None
+        committees = raw.get("committees")
+        if isinstance(committees, list) and committees:
+            committee_code = committees[0].get("systemCode")
+        if not committee_code:
+            committee = raw.get("committee", {}) or {}
+            committee_code = committee.get("systemCode")
 
         # Related bills
         associated_bills = []
@@ -416,13 +435,22 @@ class CongressHearingCollector(BaseCollector):
                     "number": bill_ref.get("number"),
                 })
 
+        # Build URL from formats if available
+        url = raw.get("url")
+        if not url:
+            formats = raw.get("formats", [])
+            for fmt in formats:
+                if isinstance(fmt, dict) and fmt.get("url"):
+                    url = fmt["url"]
+                    break
+
         return {
             "committee_code": committee_code,
             "title": title,
             "hearing_date": hearing_date,
             "chamber": chamber,
             "congress_number": raw.get("congress") or self.congress,
-            "url": raw.get("url"),
+            "url": url,
             "transcript_url": raw.get("transcriptUrl"),
             "related_bills": associated_bills,
         }
