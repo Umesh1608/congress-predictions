@@ -2,6 +2,7 @@
 
 Thin wrapper around src.ml.training and src.ml.dataset_fast.
 Run: python -m scripts.train_models [horizons...] [--catboost] [--tune] [--folds N]
+     [--autogluon] [--ft-transformer] [--ag-time-limit=N] [--embed-dim=N]
 """
 
 from __future__ import annotations
@@ -27,17 +28,28 @@ logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _parse_int_flag(args: list[str], flag: str, default: int) -> int:
+    """Parse --flag=N from command line args."""
+    for a in args:
+        if a.startswith(f"--{flag}="):
+            return int(a.split("=")[1])
+    return default
+
+
 async def main():
-    args = sys.argv[1:]
+    raw_args = sys.argv[1:]
 
     # Parse flags
-    use_catboost = "--catboost" in args
-    use_tune = "--tune" in args
-    n_trials = 50
-    for a in args:
-        if a.startswith("--trials="):
-            n_trials = int(a.split("=")[1])
-    args = [a for a in args if not a.startswith("--")]
+    use_catboost = "--catboost" in raw_args
+    use_tune = "--tune" in raw_args
+    use_autogluon = "--autogluon" in raw_args
+    use_ft_transformer = "--ft-transformer" in raw_args
+
+    n_trials = _parse_int_flag(raw_args, "trials", 50)
+    ag_time_limit = _parse_int_flag(raw_args, "ag-time-limit", 300)
+    embed_dim = _parse_int_flag(raw_args, "embed-dim", 64)
+
+    args = [a for a in raw_args if not a.startswith("--")]
 
     # Parse horizons
     horizons = [a for a in args if a in ("5d", "21d", "63d", "90d", "180d")]
@@ -46,18 +58,21 @@ async def main():
 
     if use_catboost:
         logger.info("CatBoost enabled")
+    if use_autogluon:
+        logger.info("AutoGluon enabled (time_limit=%ds)", ag_time_limit)
+    if use_ft_transformer:
+        logger.info("FT-Transformer enabled (embed_dim=%d)", embed_dim)
     if use_tune:
         logger.info("Optuna tuning enabled (%d trials)", n_trials)
 
     # Parse folds
-    n_folds = 5
-    for a in sys.argv[1:]:
-        if a.startswith("--folds="):
-            n_folds = int(a.split("=")[1])
-        elif a == "--folds":
-            idx = sys.argv.index(a)
-            if idx + 1 < len(sys.argv):
-                n_folds = int(sys.argv[idx + 1])
+    n_folds = _parse_int_flag(raw_args, "folds", 5)
+
+    # Extract GNN embeddings if FT-Transformer requested
+    gnn_embeddings = None
+    gnn_embed_cols: list[str] | None = None
+    if use_ft_transformer:
+        gnn_embeddings = await _prepare_gnn_embeddings(embed_dim)
 
     all_results: dict[str, dict] = {}
 
@@ -71,6 +86,14 @@ async def main():
             if df.empty:
                 logger.error("No training data for horizon %s!", horizon)
                 continue
+
+            # Augment with GNN embeddings if available
+            if gnn_embeddings:
+                from src.ml.gnn_embeddings import build_trade_embedding_columns
+                df, gnn_embed_cols = build_trade_embedding_columns(
+                    df, gnn_embeddings, embed_dim
+                )
+                logger.info("Augmented dataset with %d GNN embedding columns", len(gnn_embed_cols))
 
             # Optuna tuning (run before main training)
             tuned_lgbm_params: dict = {}
@@ -103,6 +126,10 @@ async def main():
                 df, session, n_folds=n_folds, use_catboost=use_catboost,
                 tuned_lgbm_params=tuned_lgbm_params,
                 tuned_catboost_params=tuned_catboost_params,
+                use_autogluon=use_autogluon,
+                ag_time_limit=ag_time_limit,
+                use_ft_transformer=use_ft_transformer,
+                gnn_embed_cols=gnn_embed_cols,
             )
             all_results[horizon] = results
 
@@ -130,6 +157,38 @@ async def main():
                     f"{metrics.get('mae', 0):>10.4f} "
                     f"{metrics.get('r2', 0):>10.4f}"
                 )
+
+
+async def _prepare_gnn_embeddings(embed_dim: int) -> dict | None:
+    """Extract graph from Neo4j and train GNN embeddings."""
+    from src.ml.gnn_embeddings import (
+        extract_graph_from_neo4j,
+        load_embeddings,
+        save_embeddings,
+        train_gnn,
+    )
+
+    # Try loading cached embeddings first
+    cached = load_embeddings()
+    if cached is not None:
+        logger.info("Using cached GNN embeddings")
+        return cached
+
+    # Extract graph and train GNN
+    try:
+        from src.db.neo4j import get_neo4j_session
+
+        logger.info("Extracting graph from Neo4j for GNN training...")
+        async with get_neo4j_session() as neo4j_session:
+            graph_data = await extract_graph_from_neo4j(neo4j_session)
+
+        logger.info("Training GNN embeddings (embed_dim=%d)...", embed_dim)
+        embeddings = train_gnn(graph_data, embed_dim=embed_dim)
+        save_embeddings(embeddings)
+        return embeddings
+    except Exception:
+        logger.exception("Failed to generate GNN embeddings — continuing without them")
+        return None
 
 
 if __name__ == "__main__":

@@ -15,8 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.ml.features import build_feature_vector
 from src.ml.models.anomaly_model import AnomalyDetector
+from src.ml.models.autogluon_predictor import AutoGluonPredictor
 from src.ml.models.base import BasePredictor
 from src.ml.models.ensemble import EnsembleModel
+from src.ml.models.ft_transformer import FTTransformerPredictor
 from src.ml.models.return_predictor import ReturnPredictor
 from src.ml.models.trade_predictor import TradePredictor
 from src.models.ml import MLModelArtifact, TradePrediction
@@ -43,6 +45,7 @@ class PredictionService:
         self._models: dict[str, BasePredictor] = {}
         self._artifact_ids: dict[str, int] = {}
         self._loaded = False
+        self._gnn_embeddings: dict | None = None
 
     async def _load_models(self, session: AsyncSession) -> None:
         """Load active model artifacts from database."""
@@ -56,6 +59,8 @@ class PredictionService:
             "return_predictor": ReturnPredictor,
             "anomaly_detector": AnomalyDetector,
             "ensemble": EnsembleModel,
+            "autogluon": AutoGluonPredictor,
+            "ft_transformer": FTTransformerPredictor,
         }
 
         for artifact in artifacts:
@@ -72,6 +77,14 @@ class PredictionService:
                     )
                 except Exception:
                     logger.exception("Failed to load model: %s", artifact.model_name)
+
+        # Load GNN embeddings if FT-Transformer model is loaded
+        if "ft_transformer" in self._models:
+            try:
+                from src.ml.gnn_embeddings import load_embeddings
+                self._gnn_embeddings = load_embeddings()
+            except Exception:
+                logger.warning("Failed to load GNN embeddings for FT-Transformer")
 
         self._loaded = True
 
@@ -150,6 +163,56 @@ class PredictionService:
                 "predicted_label": "anomalous" if anomaly_label == -1 else "normal",
                 "confidence": float(anomaly_score),
                 "feature_vector": anomaly_features,
+            })
+
+        # AutoGluon predictor
+        ag_model = self._models.get("autogluon")
+        if ag_model and ag_model.feature_columns:
+            ag_cols = ag_model.feature_columns
+            X_ag = np.array([[features.get(c, 0.0) for c in ag_cols]])
+            X_ag = np.nan_to_num(X_ag, nan=0.0)
+            ag_proba = ag_model.predict_proba(X_ag)[0]
+            ag_label = "profitable" if ag_proba > 0.5 else "unprofitable"
+            predictions.append({
+                "trade_id": trade_id,
+                "model_artifact_id": self._artifact_ids.get("autogluon"),
+                "prediction_type": "profitability",
+                "predicted_value": float(ag_proba),
+                "predicted_label": ag_label,
+                "confidence": float(abs(ag_proba - 0.5) * 2),
+                "feature_vector": features,
+            })
+
+        # FT-Transformer predictor (may need GNN embedding columns)
+        ft_model = self._models.get("ft_transformer")
+        if ft_model and ft_model.feature_columns:
+            ft_cols = ft_model.feature_columns
+            ft_features = dict(features)
+            # Append GNN embeddings if available and model expects them
+            gnn_cols = [c for c in ft_cols if c.startswith("gnn_")]
+            if gnn_cols and self._gnn_embeddings:
+                member_id = features.get("member_bioguide_id")
+                ticker = features.get("ticker")
+                member_embs = self._gnn_embeddings.get("Member", {})
+                company_embs = self._gnn_embeddings.get("Company", {})
+                m_emb = member_embs.get(member_id, np.zeros(64)) if member_id else np.zeros(64)
+                c_emb = company_embs.get(ticker, np.zeros(64)) if ticker else np.zeros(64)
+                for i in range(len(m_emb)):
+                    ft_features[f"gnn_member_{i}"] = float(m_emb[i])
+                for i in range(len(c_emb)):
+                    ft_features[f"gnn_company_{i}"] = float(c_emb[i])
+            X_ft = np.array([[ft_features.get(c, 0.0) for c in ft_cols]])
+            X_ft = np.nan_to_num(X_ft, nan=0.0)
+            ft_proba = ft_model.predict_proba(X_ft)[0]
+            ft_label = "profitable" if ft_proba > 0.5 else "unprofitable"
+            predictions.append({
+                "trade_id": trade_id,
+                "model_artifact_id": self._artifact_ids.get("ft_transformer"),
+                "prediction_type": "profitability",
+                "predicted_value": float(ft_proba),
+                "predicted_label": ft_label,
+                "confidence": float(abs(ft_proba - 0.5) * 2),
+                "feature_vector": ft_features,
             })
 
         # Store predictions

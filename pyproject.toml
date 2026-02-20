@@ -49,6 +49,8 @@ ml = [
     "spacy>=3.8.0",
     "optuna>=3.6.0",
     "catboost>=1.2.0",
+    "autogluon.tabular>=1.2.0",
+    "rtdl-revisiting-models>=0.0.2",
 ]
 dashboard = [
     "streamlit>=1.41.0",

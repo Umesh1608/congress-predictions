@@ -34,7 +34,7 @@ class ModelTrainer:
     """Orchestrates training of all ML models.
 
     Uses the fast bulk SQL dataset builder and temporal cross-validation.
-    Supports CatBoost and Optuna hyperparameter tuning.
+    Supports CatBoost, AutoGluon, FT-Transformer, and Optuna hyperparameter tuning.
     """
 
     def __init__(
@@ -46,6 +46,11 @@ class ModelTrainer:
         use_optuna: bool = False,
         optuna_trials: int = 50,
         limit: int = 20000,
+        use_autogluon: bool = False,
+        ag_time_limit: int = 300,
+        use_ft_transformer: bool = False,
+        gnn_embeddings: dict | None = None,
+        embed_dim: int = 64,
     ) -> None:
         self.artifact_dir = artifact_dir
         self.horizon = horizon
@@ -54,6 +59,11 @@ class ModelTrainer:
         self.use_optuna = use_optuna
         self.optuna_trials = optuna_trials
         self.limit = limit
+        self.use_autogluon = use_autogluon
+        self.ag_time_limit = ag_time_limit
+        self.use_ft_transformer = use_ft_transformer
+        self.gnn_embeddings = gnn_embeddings
+        self.embed_dim = embed_dim
 
     async def train_all(self, session: AsyncSession) -> dict[str, dict[str, float]]:
         """Train all models and return their metrics.
@@ -68,6 +78,15 @@ class ModelTrainer:
             return {}
 
         logger.info("Training dataset: %d samples", len(df))
+
+        # Augment with GNN embeddings if available
+        gnn_embed_cols: list[str] | None = None
+        if self.use_ft_transformer and self.gnn_embeddings:
+            from src.ml.gnn_embeddings import build_trade_embedding_columns
+            df, gnn_embed_cols = build_trade_embedding_columns(
+                df, self.gnn_embeddings, self.embed_dim
+            )
+            logger.info("Augmented dataset with %d GNN embedding columns", len(gnn_embed_cols))
 
         # Optuna tuning (optional, run before main training)
         tuned_lgbm_params: dict = {}
@@ -105,6 +124,10 @@ class ModelTrainer:
             tuned_lgbm_params=tuned_lgbm_params,
             tuned_catboost_params=tuned_catboost_params,
             artifact_dir=self.artifact_dir,
+            use_autogluon=self.use_autogluon,
+            ag_time_limit=self.ag_time_limit,
+            use_ft_transformer=self.use_ft_transformer,
+            gnn_embed_cols=gnn_embed_cols,
         )
 
         logger.info("All models trained. Results: %s", results)
@@ -121,6 +144,10 @@ async def train_models_cv(
     artifact_dir: str = ARTIFACT_BASE_DIR,
     purge_days: int = 45,
     embargo_days: int = 14,
+    use_autogluon: bool = False,
+    ag_time_limit: int = 300,
+    use_ft_transformer: bool = False,
+    gnn_embed_cols: list[str] | None = None,
 ) -> dict[str, dict[str, float]]:
     """Train all models with temporal k-fold cross-validation.
 
@@ -175,6 +202,10 @@ async def train_models_cv(
     model_names = ["trade_predictor", "return_predictor", "anomaly_detector", "ensemble"]
     if use_catboost:
         model_names.append("catboost")
+    if use_autogluon:
+        model_names.append("autogluon")
+    if use_ft_transformer:
+        model_names.append("ft_transformer")
     fold_metrics: dict[str, list[dict]] = {name: [] for name in model_names}
 
     for fold in range(n_folds):
@@ -251,6 +282,28 @@ async def train_models_cv(
                 sample_weight=w_train, tuned_params=tuned_catboost_params,
             )
             fold_metrics["catboost"].append(m)
+
+        # AutoGluon (optional)
+        if use_autogluon:
+            from src.ml.models.autogluon_predictor import AutoGluonPredictor
+            ag = AutoGluonPredictor(time_limit=ag_time_limit)
+            ag.feature_columns = feat_cols
+            ag.train(X_train, y_class_train, X_val, y_class_val, sample_weight=w_train)
+            m = evaluate_classifier(
+                y_class_val, ag.predict(X_val), ag.predict_proba(X_val)
+            )
+            fold_metrics["autogluon"].append(m)
+
+        # FT-Transformer (optional)
+        if use_ft_transformer:
+            from src.ml.models.ft_transformer import FTTransformerPredictor
+            ftt = FTTransformerPredictor()
+            ftt.feature_columns = feat_cols
+            ftt.train(X_train, y_class_train, X_val, y_class_val, sample_weight=w_train)
+            m = evaluate_classifier(
+                y_class_val, ftt.predict(X_val), ftt.predict_proba(X_val)
+            )
+            fold_metrics["ft_transformer"].append(m)
 
         # Ensemble — build meta-features from base model outputs
         tp_proba_train = tp.predict_proba(X_train)
@@ -375,6 +428,22 @@ async def train_models_cv(
     ensemble.feature_columns = EnsembleModel.META_FEATURES
     ensemble.train(meta_train, y_class_train, meta_val, y_class_val)
     await _save_artifact(session, ensemble, version, results["ensemble"], EnsembleModel.META_FEATURES, artifact_dir)
+
+    # Save AutoGluon final model (optional)
+    if use_autogluon and "autogluon" in results:
+        from src.ml.models.autogluon_predictor import AutoGluonPredictor
+        ag_final = AutoGluonPredictor(time_limit=ag_time_limit)
+        ag_final.feature_columns = feat_cols
+        ag_final.train(X_train, y_class_train, X_val, y_class_val, sample_weight=w_final_train)
+        await _save_artifact(session, ag_final, version, results["autogluon"], feat_cols, artifact_dir)
+
+    # Save FT-Transformer final model (optional)
+    if use_ft_transformer and "ft_transformer" in results:
+        from src.ml.models.ft_transformer import FTTransformerPredictor
+        ftt_final = FTTransformerPredictor()
+        ftt_final.feature_columns = feat_cols
+        ftt_final.train(X_train, y_class_train, X_val, y_class_val, sample_weight=w_final_train)
+        await _save_artifact(session, ftt_final, version, results["ft_transformer"], feat_cols, artifact_dir)
 
     return results
 
